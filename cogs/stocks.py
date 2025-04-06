@@ -35,7 +35,7 @@ class BuyStockModal(Modal):
             required=True
         )
         self.add_item(self.price)
-        self.update_stock_prices.start()
+
     
     async def on_submit(self, interaction: discord.Interaction):
         """提交處理"""
