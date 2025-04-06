@@ -827,24 +827,26 @@ class EconomicSystem:
 # 示例用法
 def main():
     # 創建經濟系統，總貨幣量10,000,000
-    system = EconomicSystem(10000000)
+    system = EconomicSystem(1000000)
     
     # 創建管理員，初始餘額7,000,000（70%的總貨幣量）
     admin = system.create_admin("超級管理員", 7000000)
     
     # 創建一些普通用戶
-    user1 = system.create_user("玩家1", 500000)
-    user2 = system.create_user("玩家2", 800000)
-    user3 = system.create_user("玩家3", 600000)
-    user4 = system.create_user("玩家4", 700000)
-    user5 = system.create_user("玩家5", 400000)
+    user1 = system.create_user("玩家1", 50000)
+    user2 = system.create_user("玩家2", 50000)
+    user3 = system.create_user("玩家3", 50000)
+    user4 = system.create_user("玩家3", 50000)
+    user5 = system.create_user("玩家3", 50000)
+    user6 = system.create_user("玩家3", 50000)
+    
     
     # 初始化股票市場
     stocks_info = [
-        ("科技公司", 100, 10000),  # 名稱，初始價格，總股數
-        ("銀行", 80, 12000),
-        ("醫療", 120, 8000),
-        ("能源", 60, 15000)
+        ("科技公司", 10000, 10000),  # 名稱，初始價格，總股數
+        ("銀行", 8000, 12000),
+        ("醫療", 1200, 8000),
+        ("能源", 6000, 15000)
     ]
     system.initialize_stock_market(stocks_info)
     
