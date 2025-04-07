@@ -61,16 +61,16 @@ class BlackjackView(discord.ui.View):
             win_amount = -self.bet
         elif dealer_value > 21:
             outcome = "莊家爆牌，玩家勝!"
-            win_amount = self.bet  # 贏得下注金額
+            win_amount = self.bet * 2  # 返还原下注金额并额外赢得下注金额
         elif player_value > dealer_value:
             outcome = "玩家勝!"
-            win_amount = self.bet  # 贏得下注金額
+            win_amount = self.bet * 2  # 返还原下注金额并额外赢得下注金额
         elif player_value < dealer_value:
             outcome = "莊家勝!"
             win_amount = -self.bet
         else:
             outcome = "平手!"
-            win_amount = 0  # 平手不變
+            win_amount = self.bet  # 平手返还原下注金额
             
         # 更新玩家金幣
         currency = Currency(self.game.bot)
