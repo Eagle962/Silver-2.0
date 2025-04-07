@@ -83,6 +83,13 @@ async def execute_query(db_name: str, query: str, parameters: tuple = (), fetch_
                 return await cursor.fetchall()
             else:
                 await conn.commit()
+                # 如果是INSERT查詢，返回最後插入的行ID
+                if query.strip().upper().startswith("INSERT"):
+                    # 獲取最後插入的ID
+                    async with conn.execute("SELECT last_insert_rowid()") as id_cursor:
+                        last_id = await id_cursor.fetchone()
+                        return last_id[0] if last_id else None
+                # 否則返回影響的行數
                 return cursor.rowcount
     except Exception as e:
         print(f"執行查詢時發生錯誤: {e}")

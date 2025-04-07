@@ -264,7 +264,7 @@ class Stock:
         return result
     
     async def place_order(self, user_id: int, stock_code: str, order_type: str, shares: int, price: float):
-        """下訂單購買或出售股票"""
+        """下訂單購買或出售股票 - 改進版"""
         # 確保資料庫已設置
         await self.setup_database()
         
@@ -316,28 +316,28 @@ class Stock:
         
         await execute_query(self.db_name, query, (user_id, stock_id, order_type, shares, price))
         
-        # 嘗試撮合訂單
-        matched = await self.match_orders(stock_id)
+        # 嘗試撮合訂單 (多次嘗試以確保交易機會)
+        for i in range(3):
+            matched = await self.match_orders(stock_id)
+            if not matched:
+                break
         
-        if matched:
-            return True, f"委託單已提交並成功撮合交易！"
-        else:
-            return True, f"委託單已提交，正在等待撮合！"
+        return True, f"委託單已提交，正在等待撮合！"
     
     async def match_orders(self, stock_id: int):
-        """撮合買賣訂單"""
+        """撮合買賣訂單 - 改進版"""
         # 獲取活躍的買賣訂單
         query_buy = '''
         SELECT order_id, user_id, shares, price 
         FROM stock_orders 
-        WHERE stock_id = ? AND order_type = 'buy' AND status = 'active'
+        WHERE stock_id = ? AND order_type = 'buy' AND status = 'active' AND shares > 0
         ORDER BY price DESC, created_at ASC
         '''
         
         query_sell = '''
         SELECT order_id, user_id, shares, price 
         FROM stock_orders 
-        WHERE stock_id = ? AND order_type = 'sell' AND status = 'active'
+        WHERE stock_id = ? AND order_type = 'sell' AND status = 'active' AND shares > 0
         ORDER BY price ASC, created_at ASC
         '''
         
@@ -348,40 +348,57 @@ class Stock:
             return False
         
         matched = False
+        iteration_limit = 10  # 限制循環次數，避免無限循環
+        iteration_count = 0
         
-        # 撮合訂單
-        for buy in buy_orders:
-            buy_id, buyer_id, buy_shares, buy_price = buy
+        # 持續撮合，直到沒有可撮合的訂單或達到循環限制
+        while iteration_count < iteration_limit:
+            iteration_count += 1
+            local_matched = False
             
-            for sell in sell_orders:
-                sell_id, seller_id, sell_shares, sell_price = sell
+            # 重新獲取最新訂單
+            if iteration_count > 1:
+                buy_orders = await execute_query(self.db_name, query_buy, (stock_id,), 'all')
+                sell_orders = await execute_query(self.db_name, query_sell, (stock_id,), 'all')
                 
-                # 如果買入價格 >= 賣出價格，可以撮合
-                if buy_price >= sell_price:
-                    # 確定交易數量
-                    trade_shares = min(buy_shares, sell_shares)
-                    
-                    # 確定交易價格（取買賣價格的平均值）
-                    trade_price = (buy_price + sell_price) / 2
-                    
-                    # 執行交易
-                    await self.execute_trade(stock_id, buyer_id, seller_id, trade_shares, trade_price)
-                    
-                    # 更新訂單狀態
-                    await self.update_order_after_trade(buy_id, sell_id, trade_shares)
-                    
-                    matched = True
-                    
-                    # 如果賣單已全部撮合，跳出內循環
-                    if sell_shares <= buy_shares:
-                        break
+                if not buy_orders or not sell_orders:
+                    break
             
-            # 如果該買單已經被全部撮合，繼續下一個買單
-            query = 'SELECT status FROM stock_orders WHERE order_id = ?'
-            result = await execute_query(self.db_name, query, (buy_id,), 'one')
+            # 遍歷所有可能的買賣組合
+            for buy in buy_orders:
+                buy_id, buyer_id, buy_shares, buy_price = buy
+                
+                for sell in sell_orders:
+                    sell_id, seller_id, sell_shares, sell_price = sell
+                    
+                    # 買家不能是賣家
+                    if buyer_id == seller_id:
+                        continue
+                    
+                    # 如果買入價格 >= 賣出價格，可以撮合
+                    if buy_price >= sell_price:
+                        # 確定交易數量
+                        trade_shares = min(buy_shares, sell_shares)
+                        if trade_shares <= 0:
+                            continue
+                        
+                        # 確定交易價格（取買賣價格的平均值）
+                        trade_price = (buy_price + sell_price) / 2
+                        
+                        # 執行交易
+                        await self.execute_trade(stock_id, buyer_id, seller_id, trade_shares, trade_price)
+                        
+                        # 更新訂單狀態
+                        await self.update_order_after_trade(buy_id, sell_id, trade_shares)
+                        
+                        local_matched = True
+                        matched = True
+                        
+                        # 找到一個匹配後不立即break，而是繼續尋找可能的匹配
             
-            if result and result[0] == 'completed':
-                continue
+            # 如果這輪沒有匹配成功，退出循環
+            if not local_matched:
+                break
         
         # 更新股票最新價格
         if matched:
@@ -426,7 +443,7 @@ class Stock:
         )
     
     async def update_order_after_trade(self, buy_order_id: int, sell_order_id: int, traded_shares: int):
-        """交易後更新訂單狀態"""
+        """交易後更新訂單狀態 - 改進版"""
         # 更新買單
         query = 'SELECT shares FROM stock_orders WHERE order_id = ?'
         result = await execute_query(self.db_name, query, (buy_order_id,), 'one')
@@ -435,9 +452,11 @@ class Stock:
             remaining_shares = result[0] - traded_shares
             
             if remaining_shares <= 0:
+                # 完全成交
                 query = 'UPDATE stock_orders SET status = "completed", shares = 0 WHERE order_id = ?'
                 await execute_query(self.db_name, query, (buy_order_id,))
             else:
+                # 部分成交
                 query = 'UPDATE stock_orders SET shares = ? WHERE order_id = ?'
                 await execute_query(self.db_name, query, (remaining_shares, buy_order_id))
         
@@ -449,9 +468,11 @@ class Stock:
             remaining_shares = result[0] - traded_shares
             
             if remaining_shares <= 0:
+                # 完全成交
                 query = 'UPDATE stock_orders SET status = "completed", shares = 0 WHERE order_id = ?'
                 await execute_query(self.db_name, query, (sell_order_id,))
             else:
+                # 部分成交
                 query = 'UPDATE stock_orders SET shares = ? WHERE order_id = ?'
                 await execute_query(self.db_name, query, (remaining_shares, sell_order_id))
     
