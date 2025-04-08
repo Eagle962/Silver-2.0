@@ -82,6 +82,7 @@ class RussianRouletteView(discord.ui.View):
             win_amount = int(self.bet_amount * multiplier)
             gain = win_amount - self.bet_amount
             
+            # 修正: 需要返還原下注加上獎金，win_amount是總收入
             await currency.update_balance(self.user_id, win_amount, str(interaction.user))
             
             embed = discord.Embed(

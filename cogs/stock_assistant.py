@@ -32,11 +32,13 @@ class TradingAssistantSystem:
         )
         ''')
         
-        # 助理設定表格
+        # 助理設定表格 - 修改為包含股票代碼欄位
+        # 'global'表示全域設定
         await cursor.execute('''
         CREATE TABLE IF NOT EXISTS assistant_settings (
             setting_id INTEGER PRIMARY KEY AUTOINCREMENT,
             assistant_id INTEGER,
+            stock_code TEXT DEFAULT 'global',
             setting_key TEXT,
             setting_value TEXT,
             FOREIGN KEY (assistant_id) REFERENCES assistants(assistant_id)
@@ -70,6 +72,20 @@ class TradingAssistantSystem:
         ''')
         
         await conn.commit()
+    
+    async def clean_stock_code(self, stock_code: str) -> str:
+        """清理股票代碼，移除或轉義可能導致SQL錯誤的特殊字符"""
+        if not stock_code:
+            return "global"
+            
+        # 移除或替換可能導致SQL問題的字符
+        cleaned_code = stock_code.replace("#", "").replace("'", "").replace('"', "")
+        
+        # 確保代碼不為空
+        if not cleaned_code:
+            return "unknown"
+            
+        return cleaned_code
     
     async def draw_assistant(self, user_id: int, username: str) -> dict:
         """抽取一個交易助理"""
@@ -153,11 +169,11 @@ class TradingAssistantSystem:
         if not assistant:
             return None
             
-        # 獲取設定
+        # 獲取全域設定
         query = '''
         SELECT setting_key, setting_value
         FROM assistant_settings
-        WHERE assistant_id = ?
+        WHERE assistant_id = ? AND stock_code = 'global'
         '''
         
         settings_rows = await execute_query(self.db_name, query, (assistant_id,), 'all')
@@ -248,9 +264,12 @@ class TradingAssistantSystem:
         
         return True
     
-    async def update_assistant_settings(self, assistant_id: int, user_id: int, settings: dict) -> bool:
+    async def update_assistant_settings(self, assistant_id: int, user_id: int, settings: dict, stock_code: str = 'global') -> bool:
         """更新助理設定"""
         await self.setup_database()
+        
+        # 清理股票代碼
+        clean_code = await self.clean_stock_code(stock_code)
         
         # 檢查助理是否屬於該用戶
         query = '''
@@ -266,24 +285,56 @@ class TradingAssistantSystem:
             
         rarity = result[0]
         
-        # 清除現有設定
+        # 清除特定股票的現有設定
         query = '''
         DELETE FROM assistant_settings
-        WHERE assistant_id = ?
+        WHERE assistant_id = ? AND stock_code = ?
         '''
         
-        await execute_query(self.db_name, query, (assistant_id,))
+        await execute_query(self.db_name, query, (assistant_id, clean_code))
         
         # 插入新設定
         for key, value in settings.items():
             query = '''
-            INSERT INTO assistant_settings (assistant_id, setting_key, setting_value)
-            VALUES (?, ?, ?)
+            INSERT INTO assistant_settings (assistant_id, stock_code, setting_key, setting_value)
+            VALUES (?, ?, ?, ?)
             '''
             
-            await execute_query(self.db_name, query, (assistant_id, key, value))
+            await execute_query(self.db_name, query, (assistant_id, clean_code, key, value))
         
         return True
+    
+    async def get_assistant_settings(self, assistant_id: int, stock_code: str = None):
+        """獲取助理設定，優先使用特定股票的設定，如果沒有則使用全域設定"""
+        # 清理股票代碼
+        clean_code = "global"
+        if stock_code:
+            clean_code = await self.clean_stock_code(stock_code)
+        
+        # 獲取全域設定
+        query = '''
+        SELECT setting_key, setting_value
+        FROM assistant_settings
+        WHERE assistant_id = ? AND stock_code = 'global'
+        '''
+        
+        global_settings = await execute_query(self.db_name, query, (assistant_id,), 'all')
+        settings = {row[0]: row[1] for row in global_settings} if global_settings else {}
+        
+        # 如果指定了股票代碼且不是全域，獲取該股票的特定設定覆蓋全域設定
+        if clean_code != "global":
+            query = '''
+            SELECT setting_key, setting_value
+            FROM assistant_settings
+            WHERE assistant_id = ? AND stock_code = ?
+            '''
+            
+            stock_settings = await execute_query(self.db_name, query, (assistant_id, clean_code), 'all')
+            if stock_settings:
+                for key, value in stock_settings:
+                    settings[key] = value
+                    
+        return settings
     
     async def update_assistant_stocks(self, assistant_id: int, user_id: int, stocks: list) -> bool:
         """更新助理監控的股票"""
@@ -322,14 +373,16 @@ class TradingAssistantSystem:
         
         await execute_query(self.db_name, query, (assistant_id,))
         
-        # 插入新股票
+        # 插入新股票，並清理每個股票代碼
         for stock_code in stocks:
-            query = '''
-            INSERT INTO assistant_stocks (assistant_id, stock_code)
-            VALUES (?, ?)
-            '''
-            
-            await execute_query(self.db_name, query, (assistant_id, stock_code))
+            clean_code = await self.clean_stock_code(stock_code)
+            if clean_code and clean_code != "unknown":
+                query = '''
+                INSERT INTO assistant_stocks (assistant_id, stock_code)
+                VALUES (?, ?)
+                '''
+                
+                await execute_query(self.db_name, query, (assistant_id, clean_code))
         
         return True
     
@@ -337,6 +390,9 @@ class TradingAssistantSystem:
                            shares: int, price: float, total_amount: float, profit_loss: float = 0) -> bool:
         """記錄交易"""
         await self.setup_database()
+        
+        # 清理股票代碼
+        clean_code = await self.clean_stock_code(stock_code)
         
         query = '''
         INSERT INTO assistant_trades 
@@ -347,7 +403,7 @@ class TradingAssistantSystem:
         await execute_query(
             self.db_name,
             query,
-            (assistant_id, stock_code, trade_type, shares, price, total_amount, profit_loss)
+            (assistant_id, clean_code, trade_type, shares, price, total_amount, profit_loss)
         )
         
         return True
@@ -372,81 +428,124 @@ class TradingAssistantSystem:
         currency = Currency(self.bot)
         
         for assistant_id, user_id, assistant_name, rarity in active_assistants:
-            # 獲取助理設定
-            query = '''
-            SELECT setting_key, setting_value
-            FROM assistant_settings
-            WHERE assistant_id = ?
-            '''
-            
-            settings_rows = await execute_query(self.db_name, query, (assistant_id,), 'all')
-            settings = {row[0]: row[1] for row in settings_rows} if settings_rows else {}
-            
-            # 獲取監控的股票
-            query = '''
-            SELECT stock_code
-            FROM assistant_stocks
-            WHERE assistant_id = ?
-            '''
-            
-            stocks_rows = await execute_query(self.db_name, query, (assistant_id,), 'all')
-            monitored_stocks = [row[0] for row in stocks_rows] if stocks_rows else []
-            
-            # 針對每支股票進行交易分析
-            for stock_code in monitored_stocks:
-                # 獲取股票資訊
-                stock_info = await stock_system.get_stock_info(stock_code)
+            try:
+                # 獲取監控的股票
+                query = '''
+                SELECT stock_code
+                FROM assistant_stocks
+                WHERE assistant_id = ?
+                '''
                 
-                if not stock_info:
-                    continue
+                stocks_rows = await execute_query(self.db_name, query, (assistant_id,), 'all')
+                monitored_stocks = []
                 
-                # 根據稀有度和設定執行不同的交易策略
-                try:
-                    if rarity == 'N':
-                        await self._execute_n_strategy(assistant_id, user_id, stock_code, stock_info, settings)
-                    elif rarity == 'R':
-                        await self._execute_r_strategy(assistant_id, user_id, stock_code, stock_info, settings)
-                    elif rarity == 'SR':
-                        await self._execute_sr_strategy(assistant_id, user_id, stock_code, stock_info, settings)
-                    elif rarity == 'SSR':
-                        await self._execute_ssr_strategy(assistant_id, user_id, stock_code, stock_info, settings)
-                except Exception as e:
-                    print(f"執行交易策略時發生錯誤: {e}")
-    
+                # 處理並清理每個股票代碼
+                if stocks_rows:
+                    for row in stocks_rows:
+                        clean_code = await self.clean_stock_code(row[0])
+                        if clean_code and clean_code != "unknown":
+                            monitored_stocks.append(clean_code)
+                
+                # 檢查助理能監控的股票數量
+                max_stocks = {
+                    'N': 1,
+                    'R': 3,
+                    'SR': 5,
+                    'SSR': 100  # 實際上不限制
+                }
+                
+                # 如果監控的股票超過限制，只處理前N個
+                if len(monitored_stocks) > max_stocks[rarity]:
+                    monitored_stocks = monitored_stocks[:max_stocks[rarity]]
+                
+                # 針對每支股票進行交易分析
+                for stock_code in monitored_stocks:
+                    try:
+                        # 獲取股票資訊
+                        stock_info = await stock_system.get_stock_info(stock_code)
+                        
+                        if not stock_info:
+                            print(f"無法獲取股票信息: {stock_code}")
+                            continue
+                        
+                        # 獲取該股票的特定設定
+                        settings = await self.get_assistant_settings(assistant_id, stock_code)
+                        
+                        # 根據稀有度和設定執行不同的交易策略
+                        if rarity == 'N':
+                            await self._execute_n_strategy(assistant_id, user_id, stock_code, stock_info, settings)
+                        elif rarity == 'R':
+                            await self._execute_r_strategy(assistant_id, user_id, stock_code, stock_info, settings)
+                        elif rarity == 'SR':
+                            await self._execute_sr_strategy(assistant_id, user_id, stock_code, stock_info, settings)
+                        elif rarity == 'SSR':
+                            await self._execute_ssr_strategy(assistant_id, user_id, stock_code, stock_info, settings)
+                    except Exception as e:
+                        print(f"處理股票 {stock_code} 時發生錯誤: {e}")
+                        
+            except Exception as e:
+                print(f"執行交易助理 {assistant_name} 的交易策略時發生錯誤: {e}")
+
     async def _execute_n_strategy(self, assistant_id, user_id, stock_code, stock_info, settings):
         """執行N級助理的交易策略"""
         current_price = stock_info['price']
         
-        # 獲取設定值或使用預設值
-        buy_threshold = float(settings.get('buy_threshold', 0))
-        sell_threshold = float(settings.get('sell_threshold', float('inf')))
-        trade_percentage = float(settings.get('trade_percentage', 10)) / 100  # 預設交易10%資金
+        # 獲取設定值或使用預設值 - 確保所有值都是浮點數
+        try:
+            buy_threshold = float(settings.get('buy_threshold', 0))
+            sell_threshold = float(settings.get('sell_threshold', float('inf')))
+            trade_percentage = float(settings.get('trade_percentage', 10)) / 100  # 預設交易10%資金
+        except (ValueError, TypeError):
+            print(f"N級助理設定格式錯誤: {settings}")
+            buy_threshold = 0
+            sell_threshold = float('inf')
+            trade_percentage = 0.1
+        
+        # 打印交易決策的詳細信息
+        print(f"N級助理 (ID: {assistant_id}) 對 {stock_code} 的決策:")
+        print(f"  當前價格: {current_price}, 買入門檻: {buy_threshold}, 賣出門檻: {sell_threshold}")
         
         # 檢查是否符合買入條件
         if buy_threshold > 0 and current_price <= buy_threshold:
+            print(f"  符合買入條件: 價格 {current_price} <= 門檻 {buy_threshold}")
             await self._execute_buy_trade(assistant_id, user_id, stock_code, current_price, trade_percentage)
         
         # 檢查是否符合賣出條件
         if sell_threshold < float('inf') and current_price >= sell_threshold:
+            print(f"  符合賣出條件: 價格 {current_price} >= 門檻 {sell_threshold}")
             await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, trade_percentage)
-    
+
     async def _execute_r_strategy(self, assistant_id, user_id, stock_code, stock_info, settings):
         """執行R級助理的交易策略"""
         current_price = stock_info['price']
         
-        # 獲取設定值
-        buy_threshold = float(settings.get('buy_threshold', 0))
-        sell_threshold = float(settings.get('sell_threshold', float('inf')))
-        stop_loss = float(settings.get('stop_loss', 0))
-        ma_short = int(settings.get('ma_short', 5))
-        ma_long = int(settings.get('ma_long', 20))
-        trade_percentage = float(settings.get('trade_percentage', 15)) / 100  # 預設交易15%資金
+        # 獲取設定值 - 確保所有值都是浮點數
+        try:
+            buy_threshold = float(settings.get('buy_threshold', 0))
+            sell_threshold = float(settings.get('sell_threshold', float('inf')))
+            stop_loss = float(settings.get('stop_loss', 0))
+            ma_short = int(settings.get('ma_short', 5))
+            ma_long = int(settings.get('ma_long', 20))
+            trade_percentage = float(settings.get('trade_percentage', 15)) / 100  # 預設交易15%資金
+        except (ValueError, TypeError):
+            print(f"R級助理設定格式錯誤: {settings}")
+            buy_threshold = 0
+            sell_threshold = float('inf')
+            stop_loss = 0
+            ma_short = 5
+            ma_long = 20
+            trade_percentage = 0.15
         
         # 獲取價格歷史
         stock_system = Stock(self.bot)
         price_history = await stock_system.get_price_history(stock_code, 30)
         
+        # 打印交易決策的詳細信息
+        print(f"R級助理 (ID: {assistant_id}) 對 {stock_code} 的決策:")
+        print(f"  當前價格: {current_price}, 歷史數據長度: {len(price_history) if price_history else 0}")
+        
         if not price_history or len(price_history) < max(ma_short, ma_long):
+            print(f"  歷史數據不足，無法計算均線")
             return
         
         # 計算移動平均線
@@ -456,53 +555,103 @@ class TradingAssistantSystem:
         ma_short_value = sum(prices[-ma_short:]) / ma_short
         ma_long_value = sum(prices[-ma_long:]) / ma_long
         
+        print(f"  短期均線({ma_short}日): {ma_short_value}, 長期均線({ma_long}日): {ma_long_value}")
+        
         # 移動平均線交叉策略
-        ma_crossover_buy = ma_short_value > ma_long_value and prices[-2] <= ma_long_value
-        ma_crossover_sell = ma_short_value < ma_long_value and prices[-2] >= ma_long_value
+        ma_crossover_buy = ma_short_value > ma_long_value and (len(prices) > 1 and prices[-2] <= ma_long_value)
+        ma_crossover_sell = ma_short_value < ma_long_value and (len(prices) > 1 and prices[-2] >= ma_long_value)
         
         # 檢查是否符合買入條件
-        if (buy_threshold > 0 and current_price <= buy_threshold) or ma_crossover_buy:
+        buy_decision = False
+        
+        if buy_threshold > 0 and current_price <= buy_threshold:
+            print(f"  符合價格門檻買入條件: 價格 {current_price} <= 門檻 {buy_threshold}")
+            buy_decision = True
+        
+        if ma_crossover_buy:
+            print(f"  符合均線交叉買入條件: 短期均線上穿長期均線")
+            buy_decision = True
+        
+        if buy_decision:
             # 市場下跌時加大交易量
-            if ma_short_value < prices[-5]:
-                trade_percentage *= 1.5
+            if len(prices) >= 5 and ma_short_value < sum(prices[-6:-1]) / 5:
+                adjusted_percentage = trade_percentage * 1.5
+                print(f"  市場下跌，加大交易量: {trade_percentage} -> {adjusted_percentage}")
+            else:
+                adjusted_percentage = trade_percentage
             
-            await self._execute_buy_trade(assistant_id, user_id, stock_code, current_price, trade_percentage)
+            await self._execute_buy_trade(assistant_id, user_id, stock_code, current_price, adjusted_percentage)
         
         # 檢查是否符合賣出條件
-        if (sell_threshold < float('inf') and current_price >= sell_threshold) or ma_crossover_sell:
+        sell_decision = False
+        
+        if sell_threshold < float('inf') and current_price >= sell_threshold:
+            print(f"  符合價格門檻賣出條件: 價格 {current_price} >= 門檻 {sell_threshold}")
+            sell_decision = True
+        
+        if ma_crossover_sell:
+            print(f"  符合均線交叉賣出條件: 短期均線下穿長期均線")
+            sell_decision = True
+        
+        if sell_decision:
             # 市場上漲時減少交易量
-            if ma_short_value > prices[-5]:
-                trade_percentage *= 0.8
-                
-            await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, trade_percentage)
+            if len(prices) >= 5 and ma_short_value > sum(prices[-6:-1]) / 5:
+                adjusted_percentage = trade_percentage * 0.8
+                print(f"  市場上漲，減少交易量: {trade_percentage} -> {adjusted_percentage}")
+            else:
+                adjusted_percentage = trade_percentage
+            
+            await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, adjusted_percentage)
         
         # 檢查止損
         if stop_loss > 0:
             # 獲取用戶持股平均成本
             user_holdings = await stock_system.get_user_stocks(user_id)
             for stock_id, code, name, shares, avg_price in user_holdings:
-                if code == stock_code and current_price <= avg_price * (1 - stop_loss / 100):
-                    # 觸發止損，賣出所有持股
-                    await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, 1.0)
-    
+                if code == stock_code and shares > 0:
+                    stop_loss_price = avg_price * (1 - stop_loss / 100)
+                    print(f"  止損檢查: 止損價 {stop_loss_price}, 當前價 {current_price}, 買入均價 {avg_price}")
+                    
+                    if current_price <= stop_loss_price:
+                        print(f"  觸發止損: 價格跌破止損線")
+                        # 觸發止損，賣出所有持股
+                        await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, 1.0)
+                        break
+
     async def _execute_sr_strategy(self, assistant_id, user_id, stock_code, stock_info, settings):
         """執行SR級助理的交易策略"""
         current_price = stock_info['price']
         
-        # 獲取設定值
-        use_rsi = settings.get('use_rsi', 'true') == 'true'
-        rsi_buy = float(settings.get('rsi_buy', 30))
-        rsi_sell = float(settings.get('rsi_sell', 70))
-        use_macd = settings.get('use_macd', 'true') == 'true'
-        use_pattern = settings.get('use_pattern', 'true') == 'true'
-        risk_reward = float(settings.get('risk_reward', 2))
-        trade_percentage = float(settings.get('trade_percentage', 20)) / 100
+        # 獲取設定值 - 確保所有值都是正確類型
+        try:
+            use_rsi = settings.get('use_rsi', 'true').lower() == 'true'
+            rsi_buy = float(settings.get('rsi_buy', 30))
+            rsi_sell = float(settings.get('rsi_sell', 70))
+            use_macd = settings.get('use_macd', 'true').lower() == 'true'
+            use_pattern = settings.get('use_pattern', 'true').lower() == 'true'
+            risk_reward = float(settings.get('risk_reward', 2))
+            trade_percentage = float(settings.get('trade_percentage', 20)) / 100
+        except (ValueError, TypeError, AttributeError):
+            print(f"SR級助理設定格式錯誤: {settings}")
+            use_rsi = True
+            rsi_buy = 30
+            rsi_sell = 70
+            use_macd = True
+            use_pattern = True
+            risk_reward = 2
+            trade_percentage = 0.2
         
         # 獲取價格歷史
         stock_system = Stock(self.bot)
         price_history = await stock_system.get_price_history(stock_code, 60)
         
+        # 打印交易決策的詳細信息
+        print(f"SR級助理 (ID: {assistant_id}) 對 {stock_code} 的決策:")
+        print(f"  當前價格: {current_price}, 歷史數據長度: {len(price_history) if price_history else 0}")
+        print(f"  設定: RSI={use_rsi}({rsi_buy}/{rsi_sell}), MACD={use_macd}, 形態={use_pattern}")
+        
         if not price_history or len(price_history) < 30:
+            print(f"  歷史數據不足，無法計算技術指標")
             return
         
         # 計算技術指標
@@ -510,42 +659,57 @@ class TradingAssistantSystem:
         prices.reverse()
         
         # 計算RSI (簡化版)
+        rsi = 50  # 預設值
         if use_rsi and len(prices) >= 14:
-            changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-            gains = [max(0, change) for change in changes]
-            losses = [max(0, -change) for change in changes]
-            
-            avg_gain = sum(gains[-14:]) / 14
-            avg_loss = sum(losses[-14:]) / 14
-            
-            if avg_loss == 0:
-                rsi = 100
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
-        else:
-            rsi = 50
+            try:
+                changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+                gains = [max(0, change) for change in changes]
+                losses = [max(0, -change) for change in changes]
+                
+                avg_gain = sum(gains[-14:]) / 14
+                avg_loss = sum(losses[-14:]) / 14
+                
+                if avg_loss == 0:
+                    rsi = 100
+                else:
+                    rs = avg_gain / avg_loss
+                    rsi = 100 - (100 / (1 + rs))
+                    
+                print(f"  RSI值: {rsi}")
+            except Exception as e:
+                print(f"  RSI計算錯誤: {e}")
+                rsi = 50
         
         # 計算MACD (簡化版)
+        macd_histogram = 0  # 預設值
         if use_macd and len(prices) >= 26:
-            ema12 = sum(prices[-12:]) / 12
-            ema26 = sum(prices[-26:]) / 26
-            macd = ema12 - ema26
-            signal = sum([prices[-(i+1)] - prices[-(i+2)] for i in range(9)]) / 9
-            macd_histogram = macd - signal
-        else:
-            macd_histogram = 0
-            
+            try:
+                ema12 = sum(prices[-12:]) / 12
+                ema26 = sum(prices[-26:]) / 26
+                macd = ema12 - ema26
+                signal = sum([prices[-(i+1)] - prices[-(i+2)] for i in range(9)]) / 9
+                macd_histogram = macd - signal
+                
+                print(f"  MACD柱狀值: {macd_histogram}")
+            except Exception as e:
+                print(f"  MACD計算錯誤: {e}")
+                macd_histogram = 0
+                
         # 識別形態 (簡化版)
         pattern_bullish = False
         pattern_bearish = False
         
         if use_pattern and len(prices) >= 5:
-            # 簡單的價格反轉模式
-            if prices[-3] < prices[-4] < prices[-5] and prices[-1] > prices[-2] > prices[-3]:
-                pattern_bullish = True
-            elif prices[-3] > prices[-4] > prices[-5] and prices[-1] < prices[-2] < prices[-3]:
-                pattern_bearish = True
+            try:
+                # 簡單的價格反轉模式
+                if prices[-3] < prices[-4] < prices[-5] and prices[-1] > prices[-2] > prices[-3]:
+                    pattern_bullish = True
+                    print(f"  檢測到看漲形態")
+                elif prices[-3] > prices[-4] > prices[-5] and prices[-1] < prices[-2] < prices[-3]:
+                    pattern_bearish = True
+                    print(f"  檢測到看跌形態")
+            except Exception as e:
+                print(f"  形態識別錯誤: {e}")
         
         # 交易決策
         buy_signals = 0
@@ -555,30 +719,43 @@ class TradingAssistantSystem:
         if use_rsi:
             if rsi <= rsi_buy:
                 buy_signals += 1
+                print(f"  RSI超賣信號")
             elif rsi >= rsi_sell:
                 sell_signals += 1
+                print(f"  RSI超買信號")
         
         # MACD信號
         if use_macd:
             if macd_histogram > 0:
                 buy_signals += 1
+                print(f"  MACD金叉信號")
             elif macd_histogram < 0:
                 sell_signals += 1
+                print(f"  MACD死叉信號")
         
         # 形態信號
         if use_pattern:
             if pattern_bullish:
                 buy_signals += 1
+                print(f"  看漲形態信號")
             elif pattern_bearish:
                 sell_signals += 1
+                print(f"  看跌形態信號")
         
         # 市場波動調整
-        volatility = sum([abs(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, min(20, len(prices)))]) / min(19, len(prices)-1)
-        if volatility > 0.02:  # 高波動
-            trade_percentage *= 0.8  # 減少交易量
+        try:
+            volatility = sum([abs(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, min(20, len(prices)))]) / min(19, len(prices)-1)
+            print(f"  市場波動率: {volatility}")
+            
+            if volatility > 0.02:  # 高波動
+                adjusted_percentage = trade_percentage * 0.8  # 減少交易量
+                print(f"  高波動率，減少交易量: {trade_percentage} -> {adjusted_percentage}")
+                trade_percentage = adjusted_percentage
+        except Exception as e:
+            print(f"  波動率計算錯誤: {e}")
         
         # 執行交易
-        total_signals = (use_rsi + use_macd + use_pattern)
+        total_signals = (1 if use_rsi else 0) + (1 if use_macd else 0) + (1 if use_pattern else 0)
         if total_signals > 0:
             # 需要過半指標給出信號
             if buy_signals > total_signals / 2:
@@ -586,30 +763,46 @@ class TradingAssistantSystem:
                 signal_strength = buy_signals / total_signals
                 adjusted_percentage = trade_percentage * signal_strength * (1 + risk_reward)
                 
+                print(f"  買入決策: 信號強度 {signal_strength}, 交易比例 {adjusted_percentage}")
                 await self._execute_buy_trade(assistant_id, user_id, stock_code, current_price, adjusted_percentage)
             
             if sell_signals > total_signals / 2:
                 signal_strength = sell_signals / total_signals
                 adjusted_percentage = trade_percentage * signal_strength
                 
+                print(f"  賣出決策: 信號強度 {signal_strength}, 交易比例 {adjusted_percentage}")
                 await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, adjusted_percentage)
-    
+
     async def _execute_ssr_strategy(self, assistant_id, user_id, stock_code, stock_info, settings):
         """執行SSR級助理的交易策略"""
         current_price = stock_info['price']
         
-        # 獲取設定值 (SSR可以設定更多高級參數)
-        strategy_type = settings.get('strategy_type', 'balanced')
-        risk_level = float(settings.get('risk_level', 0.5))
-        use_sentiment = settings.get('use_sentiment', 'true') == 'true'
-        trade_percentage = float(settings.get('trade_percentage', 25)) / 100
-        auto_balance = settings.get('auto_balance', 'true') == 'true'
+        # 獲取設定值 (SSR可以設定更多高級參數) - 確保所有值都是正確類型
+        try:
+            strategy_type = settings.get('strategy_type', 'balanced')
+            risk_level = float(settings.get('risk_level', 0.5))
+            use_sentiment = settings.get('use_sentiment', 'true').lower() == 'true'
+            trade_percentage = float(settings.get('trade_percentage', 25)) / 100
+            auto_balance = settings.get('auto_balance', 'true').lower() == 'true'
+        except (ValueError, TypeError, AttributeError):
+            print(f"SSR級助理設定格式錯誤: {settings}")
+            strategy_type = 'balanced'
+            risk_level = 0.5
+            use_sentiment = True
+            trade_percentage = 0.25
+            auto_balance = True
         
         # 獲取價格歷史和市場數據
         stock_system = Stock(self.bot)
         price_history = await stock_system.get_price_history(stock_code, 90)
         
+        # 打印交易決策的詳細信息
+        print(f"SSR級助理 (ID: {assistant_id}) 對 {stock_code} 的決策:")
+        print(f"  當前價格: {current_price}, 歷史數據長度: {len(price_history) if price_history else 0}")
+        print(f"  設定: 策略={strategy_type}, 風險={risk_level}, 使用情緒={use_sentiment}, 自動平衡={auto_balance}")
+        
         if not price_history or len(price_history) < 30:
+            print(f"  歷史數據不足，無法執行高級策略")
             return
         
         # 獲取用戶投資組合
@@ -620,107 +813,143 @@ class TradingAssistantSystem:
         prices = [price for _, price in price_history]
         prices.reverse()
         
-        # 計算多重時間週期的移動平均線
-        ma_short = sum(prices[-5:]) / 5
-        ma_medium = sum(prices[-20:]) / 20
-        ma_long = sum(prices[-50:]) / 50
-        
-        # 計算波動率
-        volatility = sum([abs(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, min(20, len(prices)))]) / min(19, len(prices)-1)
-        
-        # 市場週期判斷
-        if ma_short > ma_medium > ma_long:
-            market_cycle = "uptrend"
-        elif ma_short < ma_medium < ma_long:
-            market_cycle = "downtrend"
-        else:
-            market_cycle = "sideways"
-        
-        # 異常檢測 (簡化版)
-        recent_avg = sum(prices[-5:]) / 5
-        monthly_avg = sum(prices[-30:]) / 30
-        price_anomaly = abs(recent_avg - monthly_avg) / monthly_avg > 0.15
-        
-        # 情緒分析模擬 (實際系統需要更複雜的實現)
-        if use_sentiment:
-            # 簡單模擬市場情緒，實際系統需要從新聞或社交媒體分析
-            sentiment_score = random.uniform(-1, 1)
-        else:
-            sentiment_score = 0
-        
-        # 幸運交易機制
-        lucky_trade = random.random() < 0.05  # 5%機率
-        if lucky_trade:
-            luck_bonus = random.uniform(0.1, 0.5)  # 10-50%的額外收益
-        else:
-            luck_bonus = 0
-        
-        # 根據策略類型調整參數
-        if strategy_type == 'aggressive':
-            trade_percentage *= 1.5
-            risk_level *= 1.3
-        elif strategy_type == 'conservative':
-            trade_percentage *= 0.7
-            risk_level *= 0.7
-        
-        # 交易決策
-        buy_score = 0
-        sell_score = 0
-        
-        # 價格相對均線
-        if current_price < ma_short < ma_medium:
-            buy_score += 0.2
-        elif current_price > ma_short > ma_medium:
-            sell_score += 0.2
-        
-        # 市場週期
-        if market_cycle == "uptrend":
-            buy_score += 0.15
-        elif market_cycle == "downtrend":
-            sell_score += 0.15
-        
-        # 異常檢測
-        if price_anomaly:
-            if current_price < monthly_avg:
-                buy_score += 0.3
+        try:
+            # 計算多重時間週期的移動平均線
+            ma_short = sum(prices[-5:]) / 5
+            ma_medium = sum(prices[-20:]) / 20
+            ma_long = sum(prices[-50:]) / 50
+            
+            print(f"  移動平均線: 短期={ma_short}, 中期={ma_medium}, 長期={ma_long}")
+            
+            # 計算波動率
+            volatility = sum([abs(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, min(20, len(prices)))]) / min(19, len(prices)-1)
+            print(f"  波動率: {volatility}")
+            
+            # 市場週期判斷
+            if ma_short > ma_medium > ma_long:
+                market_cycle = "uptrend"
+            elif ma_short < ma_medium < ma_long:
+                market_cycle = "downtrend"
             else:
-                sell_score += 0.3
-        
-        # 情緒分析
-        buy_score += sentiment_score * 0.2
-        sell_score -= sentiment_score * 0.2
-        
-        # 波動率調整
-        if volatility > 0.03:  # 高波動
-            trade_percentage *= (1 - volatility * 5)  # 降低交易量
-        
-        # 投資組合平衡
-        if auto_balance and portfolio_value > 0:
-            current_holdings = 0
-            for _, code, _, shares, price in user_holdings:
-                if code == stock_code:
-                    current_holdings = shares * price
-                    break
+                market_cycle = "sideways"
+                
+            print(f"  市場週期: {market_cycle}")
             
-            # 計算目標比例 (根據風險水平)
-            target_percentage = 0.2 * risk_level  # 假設最高投入20%
-            current_percentage = current_holdings / portfolio_value
+            # 異常檢測 (簡化版)
+            recent_avg = sum(prices[-5:]) / 5
+            monthly_avg = sum(prices[-30:]) / 30
+            price_anomaly = abs(recent_avg - monthly_avg) / monthly_avg > 0.15
             
-            if current_percentage < target_percentage * 0.8:
-                buy_score += 0.25
-            elif current_percentage > target_percentage * 1.2:
-                sell_score += 0.25
-        
-        # 執行交易
-        if buy_score > 0.5 or (lucky_trade and random.random() < 0.7):
-            # 幸運交易增加買入量
-            final_percentage = trade_percentage * (1 + buy_score * risk_level) * (1 + luck_bonus)
-            await self._execute_buy_trade(assistant_id, user_id, stock_code, current_price, final_percentage)
-        
-        if sell_score > 0.5 or (lucky_trade and random.random() >= 0.7):
-            # 幸運交易增加賣出收益
-            final_percentage = trade_percentage * (1 + sell_score * risk_level) * (1 + luck_bonus)
-            await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, final_percentage)
+            if price_anomaly:
+                print(f"  檢測到價格異常: 近期均價={recent_avg}, 月均價={monthly_avg}")
+            
+            # 情緒分析模擬 (實際系統需要更複雜的實現)
+            if use_sentiment:
+                # 簡單模擬市場情緒，實際系統需要從新聞或社交媒體分析
+                sentiment_score = random.uniform(-1, 1)
+                print(f"  市場情緒分數: {sentiment_score}")
+            else:
+                sentiment_score = 0
+            
+            # 幸運交易機制
+            lucky_trade = random.random() < 0.05  # 5%機率
+            if lucky_trade:
+                luck_bonus = random.uniform(0.1, 0.5)  # 10-50%的額外收益
+                print(f"  觸發幸運交易! 獎勵: +{luck_bonus*100}%")
+            else:
+                luck_bonus = 0
+            
+            # 根據策略類型調整參數
+            original_trade_percentage = trade_percentage
+            original_risk_level = risk_level
+            
+            if strategy_type == 'aggressive':
+                trade_percentage *= 1.5
+                risk_level *= 1.3
+                print(f"  激進策略: 交易比例 {original_trade_percentage} -> {trade_percentage}, 風險 {original_risk_level} -> {risk_level}")
+            elif strategy_type == 'conservative':
+                trade_percentage *= 0.7
+                risk_level *= 0.7
+                print(f"  保守策略: 交易比例 {original_trade_percentage} -> {trade_percentage}, 風險 {original_risk_level} -> {risk_level}")
+            
+            # 交易決策
+            buy_score = 0
+            sell_score = 0
+            
+            # 價格相對均線
+            if current_price < ma_short < ma_medium:
+                buy_score += 0.2
+                print(f"  價格低於短期均線: +0.2買入分")
+            elif current_price > ma_short > ma_medium:
+                sell_score += 0.2
+                print(f"  價格高於短期均線: +0.2賣出分")
+            
+            # 市場週期
+            if market_cycle == "uptrend":
+                buy_score += 0.15
+                print(f"  上升趨勢: +0.15買入分")
+            elif market_cycle == "downtrend":
+                sell_score += 0.15
+                print(f"  下降趨勢: +0.15賣出分")
+            
+            # 異常檢測
+            if price_anomaly:
+                if current_price < monthly_avg:
+                    buy_score += 0.3
+                    print(f"  價格顯著低於月均值: +0.3買入分")
+                else:
+                    sell_score += 0.3
+                    print(f"  價格顯著高於月均值: +0.3賣出分")
+            
+            # 情緒分析
+            buy_score += sentiment_score * 0.2
+            sell_score -= sentiment_score * 0.2
+            print(f"  情緒影響: 買入{sentiment_score * 0.2:+.2f}, 賣出{-sentiment_score * 0.2:+.2f}")
+            
+            # 波動率調整
+            if volatility > 0.03:  # 高波動
+                volatility_adjustment = 1 - volatility * 5
+                trade_percentage *= volatility_adjustment
+                print(f"  高波動調整: 交易比例 * {volatility_adjustment}")
+            
+            # 投資組合平衡
+            if auto_balance and portfolio_value > 0:
+                current_holdings = 0
+                for _, code, _, shares, price in user_holdings:
+                    if code == stock_code:
+                        current_holdings = shares * price
+                        break
+                
+                # 計算目標比例 (根據風險水平)
+                target_percentage = 0.2 * risk_level  # 假設最高投入20%
+                current_percentage = current_holdings / portfolio_value if portfolio_value > 0 else 0
+                
+                print(f"  投資組合平衡: 目標佔比={target_percentage}, 當前佔比={current_percentage}")
+                
+                if current_percentage < target_percentage * 0.8:
+                    buy_score += 0.25
+                    print(f"  持股比例低於目標: +0.25買入分")
+                elif current_percentage > target_percentage * 1.2:
+                    sell_score += 0.25
+                    print(f"  持股比例高於目標: +0.25賣出分")
+            
+            # 執行交易
+            print(f"  最終評分: 買入={buy_score}, 賣出={sell_score}")
+            
+            if buy_score > 0.5 or (lucky_trade and random.random() < 0.7):
+                # 幸運交易增加買入量
+                final_percentage = trade_percentage * (1 + buy_score * risk_level) * (1 + luck_bonus)
+                print(f"  執行買入: 交易比例={final_percentage}")
+                await self._execute_buy_trade(assistant_id, user_id, stock_code, current_price, final_percentage)
+            
+            if sell_score > 0.5 or (lucky_trade and random.random() >= 0.7):
+                # 幸運交易增加賣出收益
+                final_percentage = trade_percentage * (1 + sell_score * risk_level) * (1 + luck_bonus)
+                print(f"  執行賣出: 交易比例={final_percentage}")
+                await self._execute_sell_trade(assistant_id, user_id, stock_code, current_price, final_percentage)
+                
+        except Exception as e:
+            print(f"  SSR級助理交易策略執行錯誤: {e}")
     
     async def _execute_buy_trade(self, assistant_id, user_id, stock_code, price, percentage):
         """執行買入交易"""
@@ -763,6 +992,9 @@ class TradingAssistantSystem:
                 price, 
                 total_amount
             )
+            print(f"助理 {assistant_id} 下單購買 {shares} 股 {stock_code} @ {price}")
+        else:
+            print(f"助理 {assistant_id} 下單失敗: {message}")
     
     async def _execute_sell_trade(self, assistant_id, user_id, stock_code, price, percentage):
         """執行賣出交易"""
@@ -812,6 +1044,9 @@ class TradingAssistantSystem:
                 total_amount,
                 profit_loss
             )
+            print(f"助理 {assistant_id} 下單出售 {sell_shares} 股 {stock_code} @ {price}, 盈虧: {profit_loss}")
+        else:
+            print(f"助理 {assistant_id} 下單失敗: {message}")
         
 class TradingAssistantCog(commands.Cog):
     """交易助理系統指令"""
@@ -1027,6 +1262,38 @@ class TradingAssistantCog(commands.Cog):
         # 創建設定按鈕
         view = discord.ui.View(timeout=180)
         
+        # 添加全域設定按鈕
+        global_settings_button = discord.ui.Button(label="設定全域交易策略", style=discord.ButtonStyle.primary)
+        
+        async def global_settings_callback(interaction: discord.Interaction):
+            # 創建一個模態對話框
+            modal = StrategySettingModal(details['assistant_id'], details['rarity'])
+            await interaction.response.send_modal(modal)
+        
+        global_settings_button.callback = global_settings_callback
+        view.add_item(global_settings_button)
+        
+        # 為每支監控的股票添加設定按鈕
+        for idx, stock_code in enumerate(details['stocks']):
+            # 避免添加過多按鈕，Discord限制為最多5個按鈕
+            if idx >= 4:  # 保留1個位置給監控股票按鈕
+                break
+                
+            stock_settings_button = discord.ui.Button(
+                label=f"設定 {stock_code} 策略",
+                style=discord.ButtonStyle.secondary
+            )
+            
+            # 使用閉包來確保每個按鈕有正確的stock_code
+            async def create_stock_settings_callback(stock):
+                async def stock_settings_callback(interaction: discord.Interaction):
+                    modal = StrategySettingModal(details['assistant_id'], details['rarity'], stock)
+                    await interaction.response.send_modal(modal)
+                return stock_settings_callback
+            
+            stock_settings_button.callback = await create_stock_settings_callback(stock_code)
+            view.add_item(stock_settings_button)
+        
         # 添加監控股票按鈕
         stocks_button = discord.ui.Button(label="設定監控股票", style=discord.ButtonStyle.primary)
         
@@ -1037,17 +1304,6 @@ class TradingAssistantCog(commands.Cog):
         
         stocks_button.callback = stocks_callback
         view.add_item(stocks_button)
-        
-        # 添加交易設定按鈕
-        settings_button = discord.ui.Button(label="設定交易策略", style=discord.ButtonStyle.primary)
-        
-        async def settings_callback(interaction: discord.Interaction):
-            # 創建一個模態對話框
-            modal = StrategySettingModal(details['assistant_id'], details['rarity'])
-            await interaction.response.send_modal(modal)
-        
-        settings_button.callback = settings_callback
-        view.add_item(settings_button)
         
         # 添加切換狀態按鈕
         toggle_button = discord.ui.Button(
@@ -1147,10 +1403,12 @@ class StocksSettingModal(discord.ui.Modal):
 
 class StrategySettingModal(discord.ui.Modal):
     """策略設定模態對話框"""
-    def __init__(self, assistant_id, rarity):
-        super().__init__(title="設定交易策略")
+    def __init__(self, assistant_id, rarity, stock_code=None):
+        title = f"設定交易策略{f' - {stock_code}' if stock_code else ''}"
+        super().__init__(title=title)
         self.assistant_id = assistant_id
         self.rarity = rarity
+        self.stock_code = stock_code
         
         # 根據稀有度添加不同的設定選項
         if rarity == 'N':
@@ -1389,12 +1647,14 @@ class StrategySettingModal(discord.ui.Modal):
         success = await assistant_system.update_assistant_settings(
             self.assistant_id,
             interaction.user.id,
-            settings
+            settings,
+            self.stock_code  # 傳遞股票代碼，如果是None則使用'global'
         )
         
         if success:
+            stock_text = f" {self.stock_code}" if self.stock_code else ""
             await interaction.response.send_message(
-                "已成功更新交易策略設定！",
+                f"已成功更新{stock_text}交易策略設定！",
                 ephemeral=False
             )
         else:

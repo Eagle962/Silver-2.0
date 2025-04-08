@@ -477,57 +477,79 @@ class VirtualTraderManager:
             if trader.balance < total_cost:
                 return
                 
-            # 扣除資金
-            await self.update_trader_balance(trader.trader_id, -int(total_cost))
-            
-            # 添加委託單
-            success, message = await self.stock_system.place_order(
-                trader.trader_id, 
-                code, 
-                "buy", 
-                shares, 
-                price
-            )
-            
-            if success:
-                # 記錄交易
-                await self.record_trade(
+            try:
+                # 扣除資金
+                await self.update_trader_balance(trader.trader_id, -int(total_cost))
+                
+                # 添加委託單
+                success, message = await self.stock_system.place_order(
                     trader.trader_id, 
                     code, 
                     "buy", 
                     shares, 
-                    price, 
-                    total_cost
+                    price
                 )
                 
-        elif action == "sell":
-            # 檢查持股
-            if current_shares < shares:
+                if success:
+                    # 記錄交易
+                    await self.record_trade(
+                        trader.trader_id, 
+                        code, 
+                        "buy", 
+                        shares, 
+                        price, 
+                        total_cost
+                    )
+                    print(f"虛擬交易者 {trader.name} 成功下單購買 {shares} 股 {code} @ {price}")
+                else:
+                    # 如果下單失敗，退還資金
+                    await self.update_trader_balance(trader.trader_id, int(total_cost))
+                    print(f"虛擬交易者 {trader.name} 下單失敗: {message}")
+            except Exception as e:
+                # 發生錯誤，確保退還資金
+                await self.update_trader_balance(trader.trader_id, int(total_cost))
+                print(f"虛擬交易者 {trader.name} 下單時發生錯誤: {e}")
+                
+        elif action == "sell" and current_shares > 0:
+            # 確保不會賣出超過持有量
+            shares = min(shares, current_shares)
+            
+            if shares <= 0:
                 return
                 
-            # 添加委託單
-            success, message = await self.stock_system.place_order(
-                trader.trader_id, 
-                code, 
-                "sell", 
-                shares, 
-                price
-            )
-            
-            if success:
-                # 預先扣除持股（實際交易完成後會再更新）
+            try:
+                # 先更新記錄中的持股量
                 await self.update_trader_holdings(trader.trader_id, code, -shares)
                 
-                # 記錄交易
-                total_amount = shares * price
-                await self.record_trade(
+                # 添加委託單
+                success, message = await self.stock_system.place_order(
                     trader.trader_id, 
                     code, 
                     "sell", 
                     shares, 
-                    price, 
-                    total_amount
+                    price
                 )
+                
+                if success:
+                    # 記錄交易
+                    total_amount = shares * price
+                    await self.record_trade(
+                        trader.trader_id, 
+                        code, 
+                        "sell", 
+                        shares, 
+                        price, 
+                        total_amount
+                    )
+                    print(f"虛擬交易者 {trader.name} 成功下單出售 {shares} 股 {code} @ {price}")
+                else:
+                    # 如果下單失敗，恢復持股記錄
+                    await self.update_trader_holdings(trader.trader_id, code, shares)
+                    print(f"虛擬交易者 {trader.name} 下單失敗: {message}")
+            except Exception as e:
+                # 發生錯誤，恢復持股記錄
+                await self.update_trader_holdings(trader.trader_id, code, shares)
+                print(f"虛擬交易者 {trader.name} 下單時發生錯誤: {e}")
         
         # 更新最後交易時間
         trader.last_trade_time = datetime.datetime.now()
@@ -818,6 +840,118 @@ class VirtualTradersCog(commands.Cog):
         embed.add_field(name="總資產", value=f"{stats['total_balance'] + stats['total_holdings_value']:,} Silva幣", inline=True)
         
         await interaction.response.send_message(embed=embed)
+    @app_commands.command(name="virtualorders", description="查看虛擬交易者的活躍委託單 (管理員專用)")
+    @app_commands.default_permissions(administrator=True)
+    async def virtual_orders(self, interaction: discord.Interaction):
+        """查看虛擬交易者的活躍委託單"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("你沒有權限使用此指令！", ephemeral=True)
+            return
+            
+        # 獲取所有虛擬交易者
+        traders = await self.manager.get_all_traders()
+        
+        if not traders:
+            await interaction.response.send_message("目前沒有任何虛擬交易者！", ephemeral=True)
+            return
+        
+        trader_ids = [trader.trader_id for trader in traders]
+        
+        # 獲取所有虛擬交易者的活躍委託單
+        orders = []
+        stock_system = Stock(self.bot)
+        
+        for trader_id in trader_ids:
+            trader_orders = await stock_system.get_user_orders(trader_id, active_only=True)
+            orders.extend([(trader_id, *order) for order in trader_orders])
+        
+        if not orders:
+            await interaction.response.send_message("目前沒有任何虛擬交易者的活躍委託單！", ephemeral=True)
+            return
+            
+        # 按交易者ID分組
+        orders_by_trader = {}
+        for trader_id, *order_data in orders:
+            if trader_id not in orders_by_trader:
+                orders_by_trader[trader_id] = []
+            orders_by_trader[trader_id].append(order_data)
+        
+        # 創建嵌入訊息
+        embeds = []
+        
+        for trader_id, trader_orders in orders_by_trader.items():
+            trader = None
+            for t in traders:
+                if t.trader_id == trader_id:
+                    trader = t
+                    break
+                    
+            if not trader:
+                continue
+                
+            embed = discord.Embed(
+                title=f"🤖 {trader.name} 的委託單",
+                description=f"交易者ID: {trader_id} | 餘額: {trader.balance:,} Silva幣",
+                color=discord.Color.blue()
+            )
+            
+            for order_id, stock_code, stock_name, order_type, shares, price, status, created_at in trader_orders[:5]:  # 只顯示前5個
+                type_emoji = "🟢" if order_type == "buy" else "🔴"
+                type_text = "購買" if order_type == "buy" else "出售"
+                
+                embed.add_field(
+                    name=f"#{order_id}: {type_emoji} {type_text} {stock_code}",
+                    value=f"股票: {stock_name}\n數量: {shares} 股\n價格: {price} Silva幣\n總額: {shares * price:,.2f} Silva幣\n狀態: {status}\n提交時間: {created_at}",
+                    inline=True
+                )
+                
+            embed.set_footer(text=f"共 {len(trader_orders)} 個委託單")
+            embeds.append(embed)
+        
+        if not embeds:
+            await interaction.response.send_message("無法獲取虛擬交易者的委託單信息！", ephemeral=True)
+            return
+            
+        # 發送第一個嵌入訊息
+        current_page = 0
+        
+        # 創建按鈕視圖
+        view = discord.ui.View(timeout=180)
+        
+        # 添加上一頁按鈕
+        previous_button = discord.ui.Button(label="上一頁", style=discord.ButtonStyle.primary, disabled=True)
+        
+        async def previous_callback(interaction: discord.Interaction):
+            nonlocal current_page
+            current_page -= 1
+            
+            # 更新按鈕狀態
+            previous_button.disabled = current_page == 0
+            next_button.disabled = current_page == len(embeds) - 1
+            
+            await interaction.response.edit_message(embed=embeds[current_page], view=view)
+        
+        previous_button.callback = previous_callback
+        view.add_item(previous_button)
+        
+        # 添加下一頁按鈕
+        next_button = discord.ui.Button(label="下一頁", style=discord.ButtonStyle.primary, disabled=len(embeds) == 1)
+        
+        async def next_callback(interaction: discord.Interaction):
+            nonlocal current_page
+            current_page += 1
+            
+            # 更新按鈕狀態
+            previous_button.disabled = current_page == 0
+            next_button.disabled = current_page == len(embeds) - 1
+            
+            await interaction.response.edit_message(embed=embeds[current_page], view=view)
+        
+        next_button.callback = next_callback
+        view.add_item(next_button)
+        
+        await interaction.response.send_message(embed=embeds[0], view=view if len(embeds) > 1 else None)
+
 
 async def setup(bot):
     await bot.add_cog(VirtualTradersCog(bot))
