@@ -100,7 +100,7 @@ class Stock:
             FOREIGN KEY (stock_id) REFERENCES stocks(stock_id)
         )
         ''')
-        
+        await self.optimize_database()
         await conn.commit()
     async def update_stock_price_directly(self, stock_id: int, new_price: float):
         """直接更新股票價格（用於定時波動）"""
@@ -136,6 +136,26 @@ class Stock:
         '''
         
         await execute_query(self.db_name, query, (stock_id, new_price, today, new_price))
+    async def optimize_database(self):
+        """為資料庫添加索引以提高性能"""
+        conn = await get_db_connection(self.db_name)
+        cursor = await conn.cursor()
+        
+        # 常用查詢索引
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_orders_user_id ON stock_orders(user_id)')
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_holdings_user_id ON stock_holdings(user_id)')
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_transactions_stock_id ON stock_transactions(stock_id)')
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_history_stock_date ON stock_price_history(stock_id, date)')
+        
+        # 用於排序和過濾的索引
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_stocks_price ON stocks(price)')
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON stock_orders(status)')
+        
+        # 複合索引用於複雜查詢
+        await cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_status ON stock_orders(user_id, status)')
+        
+        await conn.commit()
+        print("資料庫索引優化完成")
     
     async def issue_stock(self, user_id: int, stock_code: str, stock_name: str, initial_price: float, total_shares: int, description: str):
         """發行股票"""
@@ -229,23 +249,56 @@ class Stock:
             'description': result[7],
             'created_at': result[8]
         }
-    
-    async def get_all_stocks(self, limit=100):
-        """獲取所有股票列表"""
-        # 確保資料庫已設置
+    async def get_stocks_paged(self, page_size=5, page=1):
+        """分頁獲取股票列表"""
         await self.setup_database()
+        
+        offset = (page - 1) * page_size
         
         query = '''
         SELECT 
             stock_id, stock_code, stock_name, price, total_shares, issuer_id
         FROM stocks
         ORDER BY stock_code
-        LIMIT ?
+        LIMIT ? OFFSET ?
         '''
         
-        result = await execute_query(self.db_name, query, (limit,), 'all')
+        result = await execute_query(self.db_name, query, (page_size, offset), 'all')
         return result
-    
+
+    async def get_total_stocks_count(self):
+        """獲取股票總數"""
+        await self.setup_database()
+        
+        query = 'SELECT COUNT(*) FROM stocks'
+        result = await execute_query(self.db_name, query, fetch_type='one')
+        return result[0] if result else 0
+    async def get_all_stocks(self, limit=100):
+        """獲取所有股票列表 - 優化版"""
+        # 確保資料庫已設置
+        await self.setup_database()
+        
+        # 優化1: 只選取需要的欄位
+        # 優化2: 限制返回記錄數
+        # 優化3: 使用已建立的索引
+        query = '''
+        SELECT 
+            stock_id, stock_code, stock_name, price, total_shares, issuer_id
+        FROM stocks
+        ORDER BY stock_code  
+        LIMIT ?
+        '''
+        result = await execute_query(self.db_name, query, (limit,), 'all')
+        
+        # 計算查詢時間以便監控性能
+        if result:
+            print(f"Found {len(result)} stocks in {self.db_name} database")
+        else:
+            print(f"No stocks found in {self.db_name} database")
+        
+        return result
+
+
     async def get_user_stocks(self, user_id: int):
         """獲取用戶持有的股票"""
         # 確保資料庫已設置

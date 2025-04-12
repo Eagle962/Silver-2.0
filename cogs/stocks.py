@@ -9,6 +9,7 @@ from discord.ui import View, Button, Select, Modal, TextInput
 from models.stocks import Stock
 from models.currency import Currency
 from config import get_config_value
+from utils.database import get_db_connection, execute_query
 
 class BuyStockModal(Modal):
     """購買股票對話框"""
@@ -327,352 +328,463 @@ class StockCog(commands.Cog):
         self.bot = bot
         self.stock = Stock(bot)
         self.currency = Currency(bot)
+        # 啟動股票價格更新任務
+        self.update_stock_prices.start()
     
-    @app_commands.command(name="stocks", description="查看股票市場")
-    async def stocks(self, interaction: discord.Interaction):
-        """查看股票市場"""
-        # 獲取所有股票
-        stocks = await self.stock.get_all_stocks()
+    def cog_unload(self):
+        """Cog卸載時停止任務"""
+        self.update_stock_prices.cancel()
+    # 先定義分頁視圖類
+class StockPaginationView(discord.ui.View):
+    def __init__(self, cog, current_page, total_pages):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.current_page = current_page
+        self.total_pages = total_pages
         
-        if not stocks:
-            await interaction.response.send_message("目前還沒有任何股票！使用 `/issuestock` 來發行新股票。", ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title="📈 股票市場",
-            description="所有可交易的股票列表",
-            color=discord.Color.blue()
+        # 添加上一頁按鈕
+        self.prev_button = discord.ui.Button(
+            label="上一頁", 
+            style=discord.ButtonStyle.primary,
+            disabled=(current_page <= 1),
+            custom_id="prev_page"
         )
+        self.prev_button.callback = self.previous_page
+        self.add_item(self.prev_button)
         
-        for stock_id, code, name, price, total_shares, issuer_id in stocks:
-            try:
-                issuer = await self.bot.fetch_user(issuer_id)
-                issuer_name = issuer.name
-            except:
-                issuer_name = f"未知用戶 (ID: {issuer_id})"
-                
-            embed.add_field(
-                name=f"{code} - {name}",
-                value=f"價格: {price} Silva幣\n總股數: {total_shares:,} 股\n總市值: {price * total_shares:,.2f} Silva幣\n發行人: {issuer_name}",
-                inline=True
+        # 添加下一頁按鈕
+        self.next_button = discord.ui.Button(
+            label="下一頁", 
+            style=discord.ButtonStyle.primary,
+            disabled=(current_page >= total_pages),
+            custom_id="next_page"
+        )
+        self.next_button.callback = self.next_page
+        self.add_item(self.next_button)
+    
+    async def previous_page(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await self.cog._show_stocks_page(interaction, self.current_page - 1)
+        
+    async def next_page(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await self.cog._show_stocks_page(interaction, self.current_page + 1)
+
+
+# 然後在 StockCog 類中定義方法
+class StockCog(commands.Cog):
+
+
+    async def _show_stocks_page(self, interaction, page: int = 1):
+        """顯示股票市場的特定頁"""
+        try:
+            page = max(1, page)  # 確保頁碼至少為1
+            page_size = 5  # 每頁顯示5個股票
+            
+            # 獲取分頁數據和總計
+            stocks = await Stock.get_stocks_paged(page_size, page)
+            total_count = await Stock.get_total_stocks_count()
+            total_pages = (total_count + page_size - 1) // page_size  # 計算總頁數
+            
+            if not stocks:
+                if page > 1:
+                    await interaction.followup.send(f"頁碼 {page} 超出範圍，股票數據共有 {total_pages} 頁", ephemeral=True)
+                else:
+                    await interaction.followup.send("目前還沒有任何股票！使用 `/issuestock` 來發行新股票。", ephemeral=True)
+                return
+            
+            embed = discord.Embed(
+                title="📈 股票市場",
+                description=f"所有可交易的股票列表 (第 {page}/{total_pages} 頁)",
+                color=discord.Color.blue()
             )
-        
-        await interaction.response.send_message(embed=embed)
+            
+            # 添加股票信息
+            for stock_id, code, name, price, total_shares, issuer_id in stocks:
+                try:
+                    issuer = await self.bot.fetch_user(issuer_id)
+                    issuer_name = issuer.name
+                except:
+                    issuer_name = f"未知用戶 (ID: {issuer_id})"
+                    
+                embed.add_field(
+                    name=f"{code} - {name}",
+                    value=f"價格: {price} Silva幣\n總股數: {total_shares:,} 股\n總市值: {price * total_shares:,.2f} Silva幣\n發行人: {issuer_name}",
+                    inline=True
+                )
+            
+            # 添加導航按鈕
+            view = StockPaginationView(self, page, total_pages)
+            
+            if hasattr(interaction, 'response') and hasattr(interaction.response, 'is_done'):
+                if interaction.response.is_done():
+                    await interaction.followup.send(embed=embed, view=view)
+                else:
+                    await interaction.response.send_message(embed=embed, view=view)
+            else:
+                # 如果是編輯消息
+                await interaction.edit(embed=embed, view=view)
+        except Exception as e:
+            print(f"顯示股票頁面時發生錯誤: {e}")
+            try:
+                if hasattr(interaction, 'followup'):
+                    await interaction.followup.send("獲取股票市場資訊時發生錯誤，請通知管理員檢查。", ephemeral=True)
+            except:
+                print(f"無法發送錯誤信息: {e}")
+
+    @app_commands.command(name="stocks", description="查看股票市場")
+    @app_commands.describe(page="頁碼 (從1開始)")
+    async def stocks(self, interaction: discord.Interaction, page: int = 1):
+        """查看股票市場"""
+        await interaction.response.defer(thinking=True)
+        await self._show_stocks_page(interaction, page)
 
     @app_commands.command(name="stock", description="查看特定股票詳情")
     @app_commands.describe(stock_code="股票代號")
     async def stock(self, interaction: discord.Interaction, stock_code: str):
         """查看特定股票詳情"""
-        # 轉換為大寫
-        stock_code = stock_code.upper()
-        
-        # 獲取股票信息
-        stock_info = await self.stock.get_stock_info(stock_code)
-        
-        if not stock_info:
-            await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
-            return
-        
-        # 獲取股東資訊
-        shareholders = await self.stock.get_stock_shareholders(stock_code, 5)
-        
-        # 獲取價格歷史
-        price_history = await self.stock.get_price_history(stock_code, 7)
-        
-        # 創建嵌入訊息
-        embed = discord.Embed(
-            title=f"📊 {stock_info['stock_name']} ({stock_code})",
-            description=stock_info['description'],
-            color=discord.Color.blue()
-        )
-        
-        # 基本資訊
-        embed.add_field(name="當前價格", value=f"{stock_info['price']} Silva幣", inline=True)
-        embed.add_field(name="初始價格", value=f"{stock_info['initial_price']} Silva幣", inline=True)
-        
-        # 計算漲跌幅
-        price_change = ((stock_info['price'] / stock_info['initial_price']) - 1) * 100
-        change_symbol = "🟢" if price_change >= 0 else "🔴"
-        embed.add_field(name="總漲跌幅", value=f"{change_symbol} {price_change:.2f}%", inline=True)
-        
-        embed.add_field(name="總股數", value=f"{stock_info['total_shares']:,} 股", inline=True)
-        embed.add_field(name="總市值", value=f"{stock_info['price'] * stock_info['total_shares']:,.2f} Silva幣", inline=True)
-        
         try:
-            issuer = await self.bot.fetch_user(stock_info['issuer_id'])
-            embed.add_field(name="發行人", value=issuer.mention, inline=True)
-        except:
-            embed.add_field(name="發行人", value=f"未知用戶 (ID: {stock_info['issuer_id']})", inline=True)
-        
-        # 股價歷史
-        if price_history:
-            history_text = ""
-            for date, price in price_history:
-                history_text += f"{date}: {price} Silva幣\n"
-            embed.add_field(name="近期價格歷史", value=history_text, inline=False)
-        
-        # 主要股東
-        if shareholders:
-            shareholders_text = ""
-            for user_id, shares, percentage in shareholders:
-                try:
-                    user = await self.bot.fetch_user(user_id)
-                    shareholders_text += f"{user.mention}: {shares:,} 股 ({percentage}%)\n"
-                except:
-                    shareholders_text += f"未知用戶 (ID: {user_id}): {shares:,} 股 ({percentage}%)\n"
+            # 轉換為大寫
+            stock_code = stock_code.upper()
             
-            embed.add_field(name="主要股東", value=shareholders_text, inline=False)
-        
-        # 添加創建日期
-        created_at = datetime.datetime.strptime(stock_info['created_at'], '%Y-%m-%d %H:%M:%S')
-        embed.set_footer(text=f"發行日期: {created_at.strftime('%Y-%m-%d')}")
-        
-        # 添加按鈕
-        view = discord.ui.View(timeout=180)
-        
-        # 使用者持有的股份
-        user_holding = 0
-        user_stocks = await self.stock.get_user_stocks(interaction.user.id)
-        for stock_id, code, name, shares, price in user_stocks:
-            if code == stock_code:
-                user_holding = shares
-                break
-        
-        buy_button = discord.ui.Button(label="買入", style=discord.ButtonStyle.green)
-        async def buy_callback(interaction: discord.Interaction):
-            await interaction.response.send_modal(BuyStockModal(stock_code, stock_info['stock_name'], stock_info['price']))
-        buy_button.callback = buy_callback
-        view.add_item(buy_button)
-        
-        if user_holding > 0:
-            sell_button = discord.ui.Button(label=f"賣出 (持有: {user_holding}股)", style=discord.ButtonStyle.red)
-            async def sell_callback(interaction: discord.Interaction):
-                await interaction.response.send_modal(
-                    SellStockModal(stock_code, stock_info['stock_name'], stock_info['price'], user_holding)
-                )
-            sell_button.callback = sell_callback
-            view.add_item(sell_button)
-        
-        # 如果是股票發行人，添加派發股息按鈕
-        if interaction.user.id == stock_info['issuer_id']:
-            dividend_button = discord.ui.Button(label="派發股息", style=discord.ButtonStyle.blurple)
-            async def dividend_callback(interaction: discord.Interaction):
-                await interaction.response.send_modal(DividendModal(stock_code, stock_info['stock_name']))
-            dividend_button.callback = dividend_callback
-            view.add_item(dividend_button)
-        
-        await interaction.response.send_message(embed=embed, view=view)
+            # 獲取股票信息
+            stock_info = await self.stock.get_stock_info(stock_code)
+            
+            if not stock_info:
+                await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
+                return
+            
+            # 獲取股東資訊
+            shareholders = await self.stock.get_stock_shareholders(stock_code, 5)
+            
+            # 獲取價格歷史
+            price_history = await self.stock.get_price_history(stock_code, 7)
+            
+            # 創建嵌入訊息
+            embed = discord.Embed(
+                title=f"📊 {stock_info['stock_name']} ({stock_code})",
+                description=stock_info['description'],
+                color=discord.Color.blue()
+            )
+            
+            # 基本資訊
+            embed.add_field(name="當前價格", value=f"{stock_info['price']} Silva幣", inline=True)
+            embed.add_field(name="初始價格", value=f"{stock_info['initial_price']} Silva幣", inline=True)
+            
+            # 計算漲跌幅
+            price_change = ((stock_info['price'] / stock_info['initial_price']) - 1) * 100
+            change_symbol = "🟢" if price_change >= 0 else "🔴"
+            embed.add_field(name="總漲跌幅", value=f"{change_symbol} {price_change:.2f}%", inline=True)
+            
+            embed.add_field(name="總股數", value=f"{stock_info['total_shares']:,} 股", inline=True)
+            embed.add_field(name="總市值", value=f"{stock_info['price'] * stock_info['total_shares']:,.2f} Silva幣", inline=True)
+            
+            try:
+                issuer = await self.bot.fetch_user(stock_info['issuer_id'])
+                embed.add_field(name="發行人", value=issuer.mention, inline=True)
+            except:
+                embed.add_field(name="發行人", value=f"未知用戶 (ID: {stock_info['issuer_id']})", inline=True)
+            
+            # 股價歷史
+            if price_history:
+                history_text = ""
+                for date, price in price_history:
+                    history_text += f"{date}: {price} Silva幣\n"
+                embed.add_field(name="近期價格歷史", value=history_text, inline=False)
+            
+            # 主要股東
+            if shareholders:
+                shareholders_text = ""
+                for user_id, shares, percentage in shareholders:
+                    try:
+                        user = await self.bot.fetch_user(user_id)
+                        shareholders_text += f"{user.mention}: {shares:,} 股 ({percentage}%)\n"
+                    except:
+                        shareholders_text += f"未知用戶 (ID: {user_id}): {shares:,} 股 ({percentage}%)\n"
+                
+                embed.add_field(name="主要股東", value=shareholders_text, inline=False)
+            
+            # 添加創建日期
+            created_at = datetime.datetime.strptime(stock_info['created_at'], '%Y-%m-%d %H:%M:%S')
+            embed.set_footer(text=f"發行日期: {created_at.strftime('%Y-%m-%d')}")
+            
+            # 添加按鈕
+            view = discord.ui.View(timeout=180)
+            
+            # 使用者持有的股份
+            user_holding = 0
+            user_stocks = await self.stock.get_user_stocks(interaction.user.id)
+            for stock_id, code, name, shares, price in user_stocks:
+                if code == stock_code:
+                    user_holding = shares
+                    break
+            
+            buy_button = discord.ui.Button(label="買入", style=discord.ButtonStyle.green)
+            async def buy_callback(interaction: discord.Interaction):
+                await interaction.response.send_modal(BuyStockModal(stock_code, stock_info['stock_name'], stock_info['price']))
+            buy_button.callback = buy_callback
+            view.add_item(buy_button)
+            
+            if user_holding > 0:
+                sell_button = discord.ui.Button(label=f"賣出 (持有: {user_holding}股)", style=discord.ButtonStyle.red)
+                async def sell_callback(interaction: discord.Interaction):
+                    await interaction.response.send_modal(
+                        SellStockModal(stock_code, stock_info['stock_name'], stock_info['price'], user_holding)
+                    )
+                sell_button.callback = sell_callback
+                view.add_item(sell_button)
+            
+            # 如果是股票發行人，添加派發股息按鈕
+            if interaction.user.id == stock_info['issuer_id']:
+                dividend_button = discord.ui.Button(label="派發股息", style=discord.ButtonStyle.blurple)
+                async def dividend_callback(interaction: discord.Interaction):
+                    await interaction.response.send_modal(DividendModal(stock_code, stock_info['stock_name']))
+                dividend_button.callback = dividend_callback
+                view.add_item(dividend_button)
+            
+            await interaction.response.send_message(embed=embed, view=view)
+        except Exception as e:
+            print(f"執行 stock 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"獲取股票資訊時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="mystock", description="查看你持有的股票")
     async def my_stock(self, interaction: discord.Interaction):
         """查看你持有的股票"""
-        # 獲取用戶持股
-        stocks = await self.stock.get_user_stocks(interaction.user.id)
-        
-        if not stocks:
-            await interaction.response.send_message("你目前沒有持有任何股票！", ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title="📊 你的股票投資組合",
-            color=discord.Color.blue()
-        )
-        
-        total_value = 0
-        
-        for stock_id, code, name, shares, price in stocks:
-            value = shares * price
-            total_value += value
+        try:
+            # 獲取用戶持股
+            stocks = await self.stock.get_user_stocks(interaction.user.id)
             
-            embed.add_field(
-                name=f"{code} - {name}",
-                value=f"持有: {shares:,} 股\n價格: {price} Silva幣\n價值: {value:,.2f} Silva幣",
-                inline=True
+            if not stocks:
+                await interaction.response.send_message("你目前沒有持有任何股票！", ephemeral=True)
+                return
+            
+            embed = discord.Embed(
+                title="📊 你的股票投資組合",
+                color=discord.Color.blue()
             )
-        
-        embed.add_field(name="總投資價值", value=f"{total_value:,.2f} Silva幣", inline=False)
-        
-        # 獲取用戶餘額
-        balance = await self.currency.get_balance(interaction.user.id)
-        embed.set_footer(text=f"現金餘額: {balance:,} Silva幣 | 總資產: {balance + total_value:,.2f} Silva幣")
-        
-        await interaction.response.send_message(embed=embed)
+            
+            total_value = 0
+            
+            for stock_id, code, name, shares, price in stocks:
+                value = shares * price
+                total_value += value
+                
+                embed.add_field(
+                    name=f"{code} - {name}",
+                    value=f"持有: {shares:,} 股\n價格: {price} Silva幣\n價值: {value:,.2f} Silva幣",
+                    inline=True
+                )
+            
+            embed.add_field(name="總投資價值", value=f"{total_value:,.2f} Silva幣", inline=False)
+            
+            # 獲取用戶餘額
+            balance = await self.currency.get_balance(interaction.user.id)
+            embed.set_footer(text=f"現金餘額: {balance:,} Silva幣 | 總資產: {balance + total_value:,.2f} Silva幣")
+            
+            await interaction.response.send_message(embed=embed)
+        except Exception as e:
+            print(f"執行 mystock 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"獲取持股資訊時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="orders", description="查看你的委託單")
     @app_commands.describe(active_only="是否只顯示活躍的委託單")
     async def orders(self, interaction: discord.Interaction, active_only: bool = True):
         """查看你的委託單"""
-        # 獲取用戶委託單
-        orders = await self.stock.get_user_orders(interaction.user.id, active_only)
-        
-        if not orders:
-            message = "你目前沒有活躍的委託單！" if active_only else "你沒有任何委託單歷史！"
-            await interaction.response.send_message(message, ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title="📝 你的股票委託單",
-            description="以下是你的委託單列表" + (" (只顯示活躍的)" if active_only else ""),
-            color=discord.Color.blue()
-        )
-        
-        # 創建視圖用於取消委託單
-        view = discord.ui.View(timeout=180)
-        
-        for i, (order_id, stock_code, stock_name, order_type, shares, price, status, created_at) in enumerate(orders):
-            type_emoji = "🟢" if order_type == "buy" else "🔴"
-            type_text = "購買" if order_type == "buy" else "出售"
-            status_text = "活躍" if status == "active" else ("已完成" if status == "completed" else "已取消")
+        try:
+            # 獲取用戶委託單
+            orders = await self.stock.get_user_orders(interaction.user.id, active_only)
             
-            created_at_time = datetime.datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
-            time_str = created_at_time.strftime('%Y-%m-%d %H:%M')
+            if not orders:
+                message = "你目前沒有活躍的委託單！" if active_only else "你沒有任何委託單歷史！"
+                await interaction.response.send_message(message, ephemeral=True)
+                return
             
-            embed.add_field(
-                name=f"#{order_id}: {type_emoji} {type_text} {stock_code}",
-                value=f"股票: {stock_name}\n數量: {shares} 股\n價格: {price} Silva幣\n總額: {shares * price:,.2f} Silva幣\n狀態: {status_text}\n提交時間: {time_str}",
-                inline=True
+            embed = discord.Embed(
+                title="📝 你的股票委託單",
+                description="以下是你的委託單列表" + (" (只顯示活躍的)" if active_only else ""),
+                color=discord.Color.blue()
             )
             
-            # 為活躍的委託單添加取消按鈕
-            if status == "active" and i < 5:  # 限制按鈕數量為前5個
-                cancel_button = discord.ui.Button(label=f"取消 #{order_id}", style=discord.ButtonStyle.red, custom_id=f"cancel_{order_id}")
+            # 創建視圖用於取消委託單
+            view = discord.ui.View(timeout=180)
+            
+            for i, (order_id, stock_code, stock_name, order_type, shares, price, status, created_at) in enumerate(orders):
+                type_emoji = "🟢" if order_type == "buy" else "🔴"
+                type_text = "購買" if order_type == "buy" else "出售"
+                status_text = "活躍" if status == "active" else ("已完成" if status == "completed" else "已取消")
                 
-                async def create_cancel_callback(order_id):
-                    async def cancel_callback(interaction: discord.Interaction):
-                        success, message = await self.stock.cancel_order(interaction.user.id, order_id)
-                        
-                        if success:
-                            embed = discord.Embed(
-                                title="✅ 委託單已取消",
-                                description=message,
-                                color=discord.Color.green()
-                            )
-                            await interaction.response.send_message(embed=embed, ephemeral=False)
-                        else:
-                            embed = discord.Embed(
-                                title="❌ 取消失敗",
-                                description=message,
-                                color=discord.Color.red()
-                            )
-                            await interaction.response.send_message(embed=embed, ephemeral=True)
+                created_at_time = datetime.datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+                time_str = created_at_time.strftime('%Y-%m-%d %H:%M')
+                
+                embed.add_field(
+                    name=f"#{order_id}: {type_emoji} {type_text} {stock_code}",
+                    value=f"股票: {stock_name}\n數量: {shares} 股\n價格: {price} Silva幣\n總額: {shares * price:,.2f} Silva幣\n狀態: {status_text}\n提交時間: {time_str}",
+                    inline=True
+                )
+                
+                # 為活躍的委託單添加取消按鈕
+                if status == "active" and i < 5:  # 限制按鈕數量為前5個
+                    cancel_button = discord.ui.Button(label=f"取消 #{order_id}", style=discord.ButtonStyle.red, custom_id=f"cancel_{order_id}")
                     
-                    return cancel_callback
-                
-                cancel_button.callback = await create_cancel_callback(order_id)
-                view.add_item(cancel_button)
-        
-        # 如果沒有活躍訂單，不顯示視圖
-        has_active = any(status == "active" for _, _, _, _, _, _, status, _ in orders)
-        
-        await interaction.response.send_message(
-            embed=embed, 
-            view=view if has_active else None
-        )
+                    async def create_cancel_callback(order_id):
+                        async def cancel_callback(interaction: discord.Interaction):
+                            success, message = await self.stock.cancel_order(interaction.user.id, order_id)
+                            
+                            if success:
+                                embed = discord.Embed(
+                                    title="✅ 委託單已取消",
+                                    description=message,
+                                    color=discord.Color.green()
+                                )
+                                await interaction.response.send_message(embed=embed, ephemeral=False)
+                            else:
+                                embed = discord.Embed(
+                                    title="❌ 取消失敗",
+                                    description=message,
+                                    color=discord.Color.red()
+                                )
+                                await interaction.response.send_message(embed=embed, ephemeral=True)
+                        
+                        return cancel_callback
+                    
+                    cancel_button.callback = await create_cancel_callback(order_id)
+                    view.add_item(cancel_button)
+            
+            # 如果沒有活躍訂單，不顯示視圖
+            has_active = any(status == "active" for _, _, _, _, _, _, status, _ in orders)
+            
+            await interaction.response.send_message(
+                embed=embed, 
+                view=view if has_active else None
+            )
+        except Exception as e:
+            print(f"執行 orders 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"獲取委託單資訊時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="buystock", description="購買股票")
     @app_commands.describe(stock_code="股票代號")
     async def buy_stock(self, interaction: discord.Interaction, stock_code: str):
         """購買股票"""
-        # 轉換為大寫
-        stock_code = stock_code.upper()
-        
-        # 獲取股票信息
-        stock_info = await self.stock.get_stock_info(stock_code)
-        
-        if not stock_info:
-            await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
-            return
-        
-        # 顯示購買對話框
-        await interaction.response.send_modal(
-            BuyStockModal(stock_code, stock_info['stock_name'], stock_info['price'])
-        )
+        try:
+            # 轉換為大寫
+            stock_code = stock_code.upper()
+            
+            # 獲取股票信息
+            stock_info = await self.stock.get_stock_info(stock_code)
+            
+            if not stock_info:
+                await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
+                return
+            
+            # 顯示購買對話框
+            await interaction.response.send_modal(
+                BuyStockModal(stock_code, stock_info['stock_name'], stock_info['price'])
+            )
+        except Exception as e:
+            print(f"執行 buystock 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"準備購買股票時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="sellstock", description="賣出股票")
     @app_commands.describe(stock_code="股票代號")
     async def sell_stock(self, interaction: discord.Interaction, stock_code: str):
         """賣出股票"""
-        # 轉換為大寫
-        stock_code = stock_code.upper()
-        
-        # 獲取股票信息
-        stock_info = await self.stock.get_stock_info(stock_code)
-        
-        if not stock_info:
-            await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
-            return
-        
-        # 檢查用戶持股
-        user_stocks = await self.stock.get_user_stocks(interaction.user.id)
-        user_holding = 0
-        
-        for stock_id, code, name, shares, price in user_stocks:
-            if code == stock_code:
-                user_holding = shares
-                break
-        
-        if user_holding <= 0:
-            await interaction.response.send_message(f"你沒有持有 {stock_code} 的股票！", ephemeral=True)
-            return
-        
-        # 顯示賣出對話框
-        await interaction.response.send_modal(
-            SellStockModal(stock_code, stock_info['stock_name'], stock_info['price'], user_holding)
-        )
+        try:
+            # 轉換為大寫
+            stock_code = stock_code.upper()
+            
+            # 獲取股票信息
+            stock_info = await self.stock.get_stock_info(stock_code)
+            
+            if not stock_info:
+                await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
+                return
+            
+            # 檢查用戶持股
+            user_stocks = await self.stock.get_user_stocks(interaction.user.id)
+            user_holding = 0
+            
+            for stock_id, code, name, shares, price in user_stocks:
+                if code == stock_code:
+                    user_holding = shares
+                    break
+            
+            if user_holding <= 0:
+                await interaction.response.send_message(f"你沒有持有 {stock_code} 的股票！", ephemeral=True)
+                return
+            
+            # 顯示賣出對話框
+            await interaction.response.send_modal(
+                SellStockModal(stock_code, stock_info['stock_name'], stock_info['price'], user_holding)
+            )
+        except Exception as e:
+            print(f"執行 sellstock 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"準備賣出股票時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="issuestock", description="發行新股票")
     async def issue_stock(self, interaction: discord.Interaction):
         """發行新股票"""
-        await interaction.response.send_modal(IssueStockModal())
+        try:
+            await interaction.response.send_modal(IssueStockModal())
+        except Exception as e:
+            print(f"執行 issuestock 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"準備發行股票時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="topstocks", description="查看漲幅最高的股票")
     async def top_stocks(self, interaction: discord.Interaction):
         """查看漲幅最高的股票"""
-        # 獲取排名靠前的股票
-        top_stocks = await self.stock.get_top_stocks(5)
-        
-        if not top_stocks:
-            await interaction.response.send_message("目前還沒有任何股票交易記錄！", ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title="🏆 股票漲幅排行榜",
-            description="以下是漲幅最高的股票",
-            color=discord.Color.gold()
-        )
-        
-        for stock_code, stock_name, price, change_percent in top_stocks:
-            change_symbol = "🟢" if change_percent >= 0 else "🔴"
+        try:
+            # 獲取排名靠前的股票
+            top_stocks = await self.stock.get_top_stocks(5)
             
-            embed.add_field(
-                name=f"{change_symbol} {stock_code} - {stock_name}",
-                value=f"當前價格: {price} Silva幣\n漲跌幅: {change_percent}%",
-                inline=True
+            if not top_stocks:
+                await interaction.response.send_message("目前還沒有任何股票交易記錄！", ephemeral=True)
+                return
+            
+            embed = discord.Embed(
+                title="🏆 股票漲幅排行榜",
+                description="以下是漲幅最高的股票",
+                color=discord.Color.gold()
             )
-        
-        await interaction.response.send_message(embed=embed)
+            
+            for stock_code, stock_name, price, change_percent in top_stocks:
+                change_symbol = "🟢" if change_percent >= 0 else "🔴"
+                
+                embed.add_field(
+                    name=f"{change_symbol} {stock_code} - {stock_name}",
+                    value=f"當前價格: {price} Silva幣\n漲跌幅: {change_percent}%",
+                    inline=True
+                )
+            
+            await interaction.response.send_message(embed=embed)
+        except Exception as e:
+            print(f"執行 topstocks 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"獲取股票排行榜時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="dividend", description="為你發行的股票派發股息")
     @app_commands.describe(stock_code="股票代號")
     async def dividend(self, interaction: discord.Interaction, stock_code: str):
         """為你發行的股票派發股息"""
-        # 轉換為大寫
-        stock_code = stock_code.upper()
-        
-        # 獲取股票信息
-        stock_info = await self.stock.get_stock_info(stock_code)
-        
-        if not stock_info:
-            await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
-            return
-        
-        # 檢查是否為發行人
-        if stock_info['issuer_id'] != interaction.user.id:
-            await interaction.response.send_message("只有股票發行人可以宣布派發股息！", ephemeral=True)
-            return
-        
-        # 顯示派息對話框
-        await interaction.response.send_modal(DividendModal(stock_code, stock_info['stock_name']))
+        try:
+            # 轉換為大寫
+            stock_code = stock_code.upper()
+            
+            # 獲取股票信息
+            stock_info = await self.stock.get_stock_info(stock_code)
+            
+            if not stock_info:
+                await interaction.response.send_message(f"找不到股票 {stock_code}！", ephemeral=True)
+                return
+            
+            # 檢查是否為發行人
+            if stock_info['issuer_id'] != interaction.user.id:
+                await interaction.response.send_message("只有股票發行人可以宣布派發股息！", ephemeral=True)
+                return
+            
+            # 顯示派息對話框
+            await interaction.response.send_modal(DividendModal(stock_code, stock_info['stock_name']))
+        except Exception as e:
+            print(f"執行 dividend 指令時發生錯誤: {e}")
+            await interaction.response.send_message(f"準備派發股息時發生錯誤，請通知管理員檢查。", ephemeral=True)
 
     @app_commands.command(name="stockhelp", description="獲取股票系統使用幫助")
     async def stock_help(self, interaction: discord.Interaction):
@@ -717,6 +829,7 @@ class StockCog(commands.Cog):
         embed.add_field(name="投資小技巧", value=tips_text, inline=False)
         
         await interaction.response.send_message(embed=embed)
+
     @tasks.loop(hours=1)  # 每小時更新一次
     async def update_stock_prices(self):
         """每小時更新股票價格，添加一些隨機波動"""
@@ -735,7 +848,7 @@ class StockCog(commands.Cog):
                 new_price = max(price_limit_low, min(new_price, price_limit_high))
                 
                 # 更新價格
-                await self.update_stock_price_directly(stock_id, new_price)
+                await self.stock.update_stock_price_directly(stock_id, new_price)
                 
                 print(f"已更新股票 {code} 價格: {price} -> {new_price} ({change_percent*100:+.2f}%)")
         except Exception as e:
@@ -745,5 +858,93 @@ class StockCog(commands.Cog):
     async def before_update_stock_prices(self):
         """等待機器人準備好後再開始任務"""
         await self.bot.wait_until_ready()
+
+    # 以下是管理員用於診斷問題的指令
+    @app_commands.command(name="check_stock_db", description="檢查股票資料庫狀態 (管理員專用)")
+    @app_commands.default_permissions(administrator=True)
+    async def check_stock_db(self, interaction: discord.Interaction):
+        """檢查股票資料庫狀態"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("你沒有權限使用此指令！", ephemeral=True)
+            return
+            
+        try:
+            # 獲取資料庫連接
+            conn = await get_db_connection(self.stock.db_name)
+            cursor = await conn.cursor()
+            
+            # 檢查所有表格
+            tables = ["stocks", "stock_holdings", "stock_transactions", "stock_dividends", "stock_price_history", "stock_orders"]
+            table_status = {}
+            
+            for table in tables:
+                try:
+                    await cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                    count = await cursor.fetchone()
+                    table_status[table] = count[0] if count else 0
+                except Exception as e:
+                    table_status[table] = f"錯誤: {str(e)}"
+            
+            # 創建嵌入訊息
+            embed = discord.Embed(
+                title="📊 股票資料庫狀態",
+                color=discord.Color.blue()
+            )
+            
+            for table, status in table_status.items():
+                embed.add_field(name=table, value=str(status), inline=True)
+                
+            await interaction.response.send_message(embed=embed, ephemeral=False)
+        except Exception as e:
+            print(f"檢查股票資料庫時發生錯誤: {e}")
+            await interaction.response.send_message(f"檢查股票資料庫時發生錯誤: {str(e)}", ephemeral=True)
+
+    # @app_commands.command(name="reset_stock_db", description="重置股票資料庫 (管理員專用)")
+    # @app_commands.default_permissions(administrator=True)
+    # async def reset_stock_db(self, interaction: discord.Interaction):
+    #     """重置股票資料庫"""
+    #     if not interaction.user.guild_permissions.administrator:
+    #         await interaction.response.send_message("你沒有權限使用此指令！", ephemeral=True)
+    #         return
+            
+    #     try:
+    #         # 獲取資料庫連接
+    #         conn = await get_db_connection(self.stock.db_name)
+    #         cursor = await conn.cursor()
+            
+    #         # 刪除所有表格
+    #         tables = ["stocks", "stock_holdings", "stock_transactions", "stock_dividends", "stock_price_history", "stock_orders"]
+    #         for table in tables:
+    #             await cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                
+    #         await conn.commit()
+            
+    #         # 重新創建表格
+    #         await self.stock.setup_database()
+            
+    #         await interaction.response.send_message("✅ 股票資料庫已重置！", ephemeral=False)
+    #     except Exception as e:
+    #         print(f"重置股票資料庫時發生錯誤: {e}")
+    #         await interaction.response.send_message(f"重置股票資料庫時發生錯誤: {str(e)}", ephemeral=True)
+
+    @app_commands.command(name="update_stock_prices_now", description="立即更新所有股票價格 (管理員專用)")
+    @app_commands.default_permissions(administrator=True)
+    async def update_stock_prices_now(self, interaction: discord.Interaction):
+        """立即更新所有股票價格"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("你沒有權限使用此指令！", ephemeral=True)
+            return
+            
+        try:
+            await interaction.response.defer(thinking=True)
+            
+            # 執行價格更新
+            await self.update_stock_prices()
+            
+            await interaction.followup.send("✅ 已成功更新所有股票價格！")
+        except Exception as e:
+            print(f"立即更新股票價格時發生錯誤: {e}")
+            await interaction.followup.send(f"更新股票價格時發生錯誤: {str(e)}")
+
 async def setup(bot):
     await bot.add_cog(StockCog(bot))
