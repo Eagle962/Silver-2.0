@@ -38,6 +38,7 @@ class RandomStrategy(TradeStrategy):
     @staticmethod
     async def decide_action(trader: VirtualTrader, stock_info: dict, price_history: list, holdings: int = 0) -> Tuple[str, int, float]:
         current_price = stock_info['price']
+        total_shares = stock_info['total_shares']
         
         # 隨機決定行為
         action = random.choices(["buy", "sell", "hold"], weights=[0.4, 0.4, 0.2])[0]
@@ -51,13 +52,15 @@ class RandomStrategy(TradeStrategy):
             action = "hold"
         
         if action == "buy":
-            # 決定買入數量和價格
-            max_shares = max(1, int(trader.balance * trader.risk_level / current_price))
+            # 決定買入數量和價格，限制最大買入量為總股數的0.5%
+            max_affordable = max(1, int(trader.balance * trader.risk_level / current_price))
+            max_allowed = max(1, int(total_shares * 0.005))  # 總股數的0.5%
+            max_shares = min(max_affordable, max_allowed)
             shares = random.randint(1, max_shares)
             
-            # 決定買入價格，在當前價格的±5%範圍內
+            # 決定買入價格，在當前價格的±5%範圍內，四捨五入到小數點後2位
             price_variation = random.uniform(-0.05, 0.05)
-            price = current_price * (1 + price_variation)
+            price = round(current_price * (1 + price_variation), 2)
             
             return "buy", shares, price
             
@@ -65,9 +68,9 @@ class RandomStrategy(TradeStrategy):
             # 決定賣出數量
             shares = random.randint(1, holdings)
             
-            # 決定賣出價格，在當前價格的±5%範圍內
+            # 決定賣出價格，在當前價格的±5%範圍內，四捨五入到小數點後2位
             price_variation = random.uniform(-0.05, 0.05)
-            price = current_price * (1 + price_variation)
+            price = round(current_price * (1 + price_variation), 2)
             
             return "sell", shares, price
             
@@ -82,6 +85,7 @@ class TrendFollowingStrategy(TradeStrategy):
             return "hold", 0, 0
             
         current_price = stock_info['price']
+        total_shares = stock_info['total_shares']
         
         # 計算短期和長期移動平均線
         prices = [price for _, price in price_history]
@@ -107,13 +111,15 @@ class TrendFollowingStrategy(TradeStrategy):
             action = "hold"
         
         if action == "buy":
-            # 決定買入數量和價格
-            max_shares = max(1, int(trader.balance * trader.risk_level / current_price))
+            # 決定買入數量和價格，限制最大買入量為總股數的0.5%
+            max_affordable = max(1, int(trader.balance * trader.risk_level / current_price))
+            max_allowed = max(1, int(total_shares * 0.005))  # 總股數的0.5%
+            max_shares = min(max_affordable, max_allowed)
             shares = random.randint(1, max_shares)
             
-            # 買入價格接近當前價格
+            # 買入價格接近當前價格，四捨五入到小數點後2位
             price_variation = random.uniform(-0.02, 0.02)
-            price = current_price * (1 + price_variation)
+            price = round(current_price * (1 + price_variation), 2)
             
             return "buy", shares, price
             
@@ -121,9 +127,9 @@ class TrendFollowingStrategy(TradeStrategy):
             # 決定賣出數量
             shares = random.randint(1, holdings)
             
-            # 賣出價格接近當前價格
+            # 賣出價格接近當前價格，四捨五入到小數點後2位
             price_variation = random.uniform(-0.02, 0.02)
-            price = current_price * (1 + price_variation)
+            price = round(current_price * (1 + price_variation), 2)
             
             return "sell", shares, price
             
@@ -138,6 +144,7 @@ class ReverseStrategy(TradeStrategy):
             return "hold", 0, 0
             
         current_price = stock_info['price']
+        total_shares = stock_info['total_shares']
         
         # 計算近期漲跌幅
         prices = [price for _, price in price_history]
@@ -162,13 +169,15 @@ class ReverseStrategy(TradeStrategy):
             action = "hold"
         
         if action == "buy":
-            # 決定買入數量和價格
-            max_shares = max(1, int(trader.balance * trader.risk_level / current_price))
+            # 決定買入數量和價格，限制最大買入量為總股數的0.5%
+            max_affordable = max(1, int(trader.balance * trader.risk_level / current_price))
+            max_allowed = max(1, int(total_shares * 0.005))  # 總股數的0.5%
+            max_shares = min(max_affordable, max_allowed)
             shares = random.randint(1, max_shares)
             
-            # 買入價格略低於當前價格
+            # 買入價格略低於當前價格，四捨五入到小數點後2位
             price_variation = random.uniform(-0.04, -0.01)
-            price = current_price * (1 + price_variation)
+            price = round(current_price * (1 + price_variation), 2)
             
             return "buy", shares, price
             
@@ -176,9 +185,9 @@ class ReverseStrategy(TradeStrategy):
             # 決定賣出數量
             shares = random.randint(1, holdings)
             
-            # 賣出價格略高於當前價格
+            # 賣出價格略高於當前價格，四捨五入到小數點後2位
             price_variation = random.uniform(0.01, 0.04)
-            price = current_price * (1 + price_variation)
+            price = round(current_price * (1 + price_variation), 2)
             
             return "sell", shares, price
             
@@ -209,18 +218,6 @@ class VirtualTraderManager:
             risk_level REAL DEFAULT 0.5,
             active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        
-        # 虛擬交易者持股表格
-        await cursor.execute('''
-        CREATE TABLE IF NOT EXISTS virtual_holdings (
-            holding_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trader_id INTEGER,
-            stock_code TEXT,
-            shares INTEGER DEFAULT 0,
-            UNIQUE(trader_id, stock_code),
-            FOREIGN KEY (trader_id) REFERENCES virtual_traders(trader_id)
         )
         ''')
         
@@ -297,6 +294,10 @@ class VirtualTraderManager:
                 risk_level=risk_level
             )
             
+            # 在 Currency 系統中設置相同的餘額
+            currency = Currency(self.bot)
+            await currency.update_balance(trader_id, balance, f"初始化虛擬交易者 {name} 資金")
+            
         return trader_id
         
     async def get_all_traders(self) -> List[VirtualTrader]:
@@ -326,6 +327,18 @@ class VirtualTraderManager:
         await execute_query(self.db_name, query, (trader.balance, trader_id))
         
         return True
+    
+    async def sync_trader_balance(self, trader_id: int):
+        """同步虛擬交易者在Currency系統中的餘額"""
+        trader = await self.get_trader(trader_id)
+        if trader:
+            currency = Currency(self.bot)
+            current_balance = await currency.get_balance(trader_id)
+            delta = trader.balance - current_balance
+            if delta != 0:
+                await currency.update_balance(trader_id, delta, f"同步虛擬交易者 {trader.name} 餘額")
+                return True
+        return False
         
     async def toggle_trader_active(self, trader_id: int) -> bool:
         """切換虛擬交易者的活躍狀態"""
@@ -368,58 +381,20 @@ class VirtualTraderManager:
         return True
         
     async def get_trader_holdings(self, trader_id: int) -> Dict[str, int]:
-        """獲取虛擬交易者的持股情況"""
-        query = '''
-        SELECT stock_code, shares
-        FROM virtual_holdings
-        WHERE trader_id = ?
-        '''
-        
-        result = await execute_query(self.db_name, query, (trader_id,), 'all')
-        
-        holdings = {}
-        if result:
-            for stock_code, shares in result:
-                holdings[stock_code] = shares
-                
-        return holdings
-        
-    async def update_trader_holdings(self, trader_id: int, stock_code: str, shares_change: int):
-        """更新虛擬交易者的持股"""
-        query = '''
-        SELECT shares
-        FROM virtual_holdings
-        WHERE trader_id = ? AND stock_code = ?
-        '''
-        
-        result = await execute_query(self.db_name, query, (trader_id, stock_code), 'one')
-        
-        if result:
-            current_shares = result[0]
-            new_shares = current_shares + shares_change
+        """獲取虛擬交易者的持股情況 - 直接從股票系統獲取真實持股"""
+        try:
+            # 直接從股票系統獲取用戶真實持股
+            user_stocks = await self.stock_system.get_user_stocks(trader_id)
             
-            if new_shares > 0:
-                query = '''
-                UPDATE virtual_holdings
-                SET shares = ?
-                WHERE trader_id = ? AND stock_code = ?
-                '''
-                
-                await execute_query(self.db_name, query, (new_shares, trader_id, stock_code))
-            else:
-                query = '''
-                DELETE FROM virtual_holdings
-                WHERE trader_id = ? AND stock_code = ?
-                '''
-                
-                await execute_query(self.db_name, query, (trader_id, stock_code))
-        elif shares_change > 0:
-            query = '''
-            INSERT INTO virtual_holdings (trader_id, stock_code, shares)
-            VALUES (?, ?, ?)
-            '''
-            
-            await execute_query(self.db_name, query, (trader_id, stock_code, shares_change))
+            holdings = {}
+            if user_stocks:
+                for stock_id, code, name, shares, price in user_stocks:
+                    holdings[code] = shares
+                    
+            return holdings
+        except Exception as e:
+            print(f"獲取虛擬交易者持股時發生錯誤: {e}")
+            return {}
             
     async def record_trade(self, trader_id: int, stock_code: str, action: str, shares: int, price: float, total_amount: float):
         """記錄交易"""
@@ -452,7 +427,7 @@ class VirtualTraderManager:
         # 獲取價格歷史
         price_history = await self.stock_system.get_price_history(code, 30)
         
-        # 獲取持股情況
+        # 獲取持股情況 - 直接從股票系統獲取真實持股
         holdings = await self.get_trader_holdings(trader.trader_id)
         current_shares = holdings.get(code, 0)
         
@@ -500,6 +475,7 @@ class VirtualTraderManager:
                         price, 
                         total_cost
                     )
+                    
                     print(f"虛擬交易者 {trader.name} 成功下單購買 {shares} 股 {code} @ {price}")
                 else:
                     # 如果下單失敗，退還資金
@@ -518,9 +494,6 @@ class VirtualTraderManager:
                 return
                 
             try:
-                # 先更新記錄中的持股量
-                await self.update_trader_holdings(trader.trader_id, code, -shares)
-                
                 # 添加委託單
                 success, message = await self.stock_system.place_order(
                     trader.trader_id, 
@@ -543,12 +516,8 @@ class VirtualTraderManager:
                     )
                     print(f"虛擬交易者 {trader.name} 成功下單出售 {shares} 股 {code} @ {price}")
                 else:
-                    # 如果下單失敗，恢復持股記錄
-                    await self.update_trader_holdings(trader.trader_id, code, shares)
                     print(f"虛擬交易者 {trader.name} 下單失敗: {message}")
             except Exception as e:
-                # 發生錯誤，恢復持股記錄
-                await self.update_trader_holdings(trader.trader_id, code, shares)
                 print(f"虛擬交易者 {trader.name} 下單時發生錯誤: {e}")
         
         # 更新最後交易時間
@@ -840,6 +809,7 @@ class VirtualTradersCog(commands.Cog):
         embed.add_field(name="總資產", value=f"{stats['total_balance'] + stats['total_holdings_value']:,} Silva幣", inline=True)
         
         await interaction.response.send_message(embed=embed)
+    
     @app_commands.command(name="virtualorders", description="查看虛擬交易者的活躍委託單 (管理員專用)")
     @app_commands.default_permissions(administrator=True)
     async def virtual_orders(self, interaction: discord.Interaction):
@@ -950,7 +920,35 @@ class VirtualTradersCog(commands.Cog):
         next_button.callback = next_callback
         view.add_item(next_button)
         
-        await interaction.response.send_message(embed=embeds[0], view=view if len(embeds) > 1 else None)
+        # 修復了 view=None 錯誤，改為始終提供 view
+        # 當只有一頁時，禁用兩個按鈕但仍然提供 view
+        if len(embeds) == 1:
+            previous_button.disabled = True
+            next_button.disabled = True
+            
+        await interaction.response.send_message(embed=embeds[0], view=view)
+
+    @app_commands.command(name="syncvirtualtraders", description="同步所有虛擬交易者的餘額 (管理員專用)")
+    @app_commands.default_permissions(administrator=True)
+    async def sync_virtual_traders(self, interaction: discord.Interaction):
+        """同步所有虛擬交易者的餘額"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("你沒有權限使用此指令！", ephemeral=True)
+            return
+            
+        await interaction.response.defer(thinking=True)
+        
+        try:
+            traders = await self.manager.get_all_traders()
+            synced = 0
+            
+            for trader in traders:
+                if await self.manager.sync_trader_balance(trader.trader_id):
+                    synced += 1
+                    
+            await interaction.followup.send(f"✅ 已同步 {synced}/{len(traders)} 個虛擬交易者的餘額！")
+        except Exception as e:
+            await interaction.followup.send(f"❌ 同步餘額時發生錯誤: {str(e)}")
 
 
 async def setup(bot):
